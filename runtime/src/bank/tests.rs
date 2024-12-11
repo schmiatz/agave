@@ -37,11 +37,7 @@ use {
         compute_budget_processor::{self, MAX_COMPUTE_UNIT_LIMIT},
         prioritization_fee::{PrioritizationFeeDetails, PrioritizationFeeType},
     },
-<<<<<<< HEAD
-=======
     solana_cost_model::block_cost_limits::{MAX_BLOCK_UNITS, MAX_BLOCK_UNITS_SIMD_0207},
-    solana_feature_set::{self as feature_set, FeatureSet},
->>>>>>> ccb3cd3a7 (SIMD-0207: Raise block limit to 50M (#4026))
     solana_inline_spl::token,
     solana_logger,
     solana_program_runtime::{
