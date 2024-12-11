@@ -861,6 +861,10 @@ pub mod disable_account_loader_special_case {
     solana_program::declare_id!("EQUMpNFr7Nacb1sva56xn1aLfBxppEoSBH8RRVdkcD1x");
 }
 
+pub mod raise_block_limits_to_50m {
+    solana_pubkey::declare_id!("5oMCU3JPaFLr8Zr4ct7yFA7jdk6Mw1RmB8K4u9ZbS42z");
+}
+
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
@@ -1068,9 +1072,23 @@ lazy_static! {
         (verify_retransmitter_signature::id(), "Verify retransmitter signature #1840"),
         (vote_only_retransmitter_signed_fec_sets::id(), "vote only on retransmitter signed fec sets"),
         (partitioned_epoch_rewards_superfeature::id(), "replaces enable_partitioned_epoch_reward to enable partitioned rewards at epoch boundary SIMD-0118"),
+<<<<<<< HEAD:sdk/src/feature_set.rs
         (enable_turbine_extended_fanout_experiments::id(), "enable turbine extended fanout experiments #2373"),
         (deprecate_legacy_vote_ixs::id(), "Deprecate legacy vote instructions"),
         (disable_account_loader_special_case::id(), "Disable account loader special case"),
+=======
+        (disable_sbpf_v1_execution::id(), "Disables execution of SBPFv1 programs"),
+        (reenable_sbpf_v1_execution::id(), "Re-enables execution of SBPFv1 programs"),
+        (remove_accounts_executable_flag_checks::id(), "Remove checks of accounts is_executable flag SIMD-0162"),
+        (lift_cpi_caller_restriction::id(), "Lift the restriction in CPI that the caller must have the callee as an instruction account #2202"),
+        (disable_account_loader_special_case::id(), "Disable account loader special case #3513"),
+        (accounts_lt_hash::id(), "enables lattice-based accounts hash #3333"),
+        (enable_secp256r1_precompile::id(), "Enable secp256r1 precompile SIMD-0075"),
+        (migrate_stake_program_to_core_bpf::id(), "Migrate Stake program to Core BPF SIMD-0196 #3655"),
+        (deplete_cu_meter_on_vm_failure::id(), "Deplete compute meter for vm errors SIMD-0182 #3993"),
+        (reserve_minimal_cus_for_builtin_instructions::id(), "Reserve minimal CUs for builtin instructions SIMD-170 #2562"),
+        (raise_block_limits_to_50m::id(), "Raise block limit to 50M SIMD-0207"),
+>>>>>>> ccb3cd3a7 (SIMD-0207: Raise block limit to 50M (#4026)):sdk/feature-set/src/lib.rs
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
