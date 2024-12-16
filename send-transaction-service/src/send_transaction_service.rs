@@ -145,7 +145,7 @@ impl SendTransactionService {
         bank_forks: &Arc<RwLock<BankForks>>,
         leader_info: Option<T>,
         receiver: Receiver<TransactionInfo>,
-        connection_cache: Arc<ConnectionCache>,
+        connection_cache: &Arc<ConnectionCache>,
         retry_rate_ms: u64,
         leader_forward_count: u64,
         exit: Arc<AtomicBool>,
@@ -171,7 +171,7 @@ impl SendTransactionService {
         bank_forks: &Arc<RwLock<BankForks>>,
         leader_info: Option<T>,
         receiver: Receiver<TransactionInfo>,
-        connection_cache: Arc<ConnectionCache>,
+        connection_cache: &Arc<ConnectionCache>,
         config: Config,
         exit: Arc<AtomicBool>,
     ) -> Self {
@@ -180,7 +180,7 @@ impl SendTransactionService {
         let retry_transactions = Arc::new(Mutex::new(HashMap::new()));
 
         let client = ConnectionCacheClient::new(
-            connection_cache,
+            connection_cache.clone(),
             tpu_address,
             config.tpu_peers,
             leader_info,
@@ -524,7 +524,7 @@ mod test {
             &bank_forks,
             None,
             receiver,
-            connection_cache,
+            &connection_cache,
             1000,
             1,
             Arc::new(AtomicBool::new(false)),
@@ -558,7 +558,7 @@ mod test {
             &bank_forks,
             None,
             receiver,
-            connection_cache,
+            &connection_cache,
             1000,
             1,
             exit.clone(),
