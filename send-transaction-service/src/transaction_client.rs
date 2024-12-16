@@ -1,8 +1,5 @@
 use {
-    crate::{
-        send_transaction_service::{CurrentLeaderInfo, SendTransactionServiceStats},
-        tpu_info::TpuInfo,
-    },
+    crate::{send_transaction_service_stats::SendTransactionServiceStats, tpu_info::TpuInfo},
     log::warn,
     solana_client::connection_cache::ConnectionCache,
     solana_connection_cache::client_connection::ClientConnection as TpuConnection,
@@ -10,6 +7,7 @@ use {
     std::{
         net::SocketAddr,
         sync::{atomic::Ordering, Arc, Mutex},
+        time::{Duration, Instant},
     },
 };
 
@@ -122,6 +120,55 @@ where
 
         for address in &addresses {
             self.send_transactions(address, wire_transactions.clone(), stats);
+        }
+    }
+}
+
+/// The leader info refresh rate.
+pub const LEADER_INFO_REFRESH_RATE_MS: u64 = 1000;
+
+/// A struct responsible for holding up-to-date leader information
+/// used for sending transactions.
+pub(crate) struct CurrentLeaderInfo<T>
+where
+    T: TpuInfo + std::marker::Send + 'static,
+{
+    /// The last time the leader info was refreshed
+    last_leader_refresh: Option<Instant>,
+
+    /// The leader info
+    leader_info: Option<T>,
+
+    /// How often to refresh the leader info
+    refresh_rate: Duration,
+}
+
+impl<T> CurrentLeaderInfo<T>
+where
+    T: TpuInfo + std::marker::Send + 'static,
+{
+    /// Get the leader info, refresh if expired
+    pub fn get_leader_info(&mut self) -> Option<&T> {
+        if let Some(leader_info) = self.leader_info.as_mut() {
+            let now = Instant::now();
+            let need_refresh = self
+                .last_leader_refresh
+                .map(|last| now.duration_since(last) >= self.refresh_rate)
+                .unwrap_or(true);
+
+            if need_refresh {
+                leader_info.refresh_recent_peers();
+                self.last_leader_refresh = Some(now);
+            }
+        }
+        self.leader_info.as_ref()
+    }
+
+    pub fn new(leader_info: Option<T>) -> Self {
+        Self {
+            last_leader_refresh: None,
+            leader_info,
+            refresh_rate: Duration::from_millis(LEADER_INFO_REFRESH_RATE_MS),
         }
     }
 }
