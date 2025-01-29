@@ -147,7 +147,7 @@ dependencies = [
  "getrandom 0.2.15",
  "once_cell",
  "version_check",
- "zerocopy",
+ "zerocopy 0.7.35",
 ]
 
 [[package]]
@@ -1920,6 +1920,18 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a49c392881ce6d5c3b8cb70f98717b7c07aabbdff06687b9030dbfbe2725f8"
+dependencies = [
+ "cfg-if 1.0.0",
+ "libc",
+ "wasi 0.13.3+wasi-0.2.2",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -3703,7 +3715,7 @@ version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77957b295656769bb8ad2b6a6b09d897d94f05c41b069aede1fcdaa675eaea04"
 dependencies = [
- "zerocopy",
+ "zerocopy 0.7.35",
 ]
 
 [[package]]
@@ -4023,6 +4035,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3779b94aeb87e8bd4e834cee3650289ee9e0d5677f976ecdb6d219e5f4f6cd94"
+dependencies = [
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.0",
+ "zerocopy 0.8.14",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4043,6 +4066,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_chacha"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.9.0",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4058,6 +4091,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.15",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b08f3c9802962f7e1b25113931d94f43ed9725bebc59db9d0c3e9a23b67e15ff"
+dependencies = [
+ "getrandom 0.3.1",
+ "zerocopy 0.8.14",
 ]
 
 [[package]]
@@ -4946,7 +4989,7 @@ dependencies = [
  "modular-bitfield",
  "num_cpus",
  "num_enum",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rayon",
  "seqlock",
  "serde",
@@ -5095,7 +5138,7 @@ dependencies = [
  "bv",
  "fnv",
  "log",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_derive",
  "solana-sanitize",
@@ -5178,7 +5221,7 @@ dependencies = [
  "memmap2",
  "modular-bitfield",
  "num_enum",
- "rand 0.8.5",
+ "rand 0.9.0",
  "solana-clock",
  "solana-measure",
  "solana-pubkey",
@@ -5469,7 +5512,7 @@ dependencies = [
  "futures-util",
  "indexmap 2.7.1",
  "log",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rayon",
  "solana-keypair",
  "solana-measure",
@@ -5511,7 +5554,7 @@ dependencies = [
  "prio-graph",
  "qualifier_attr",
  "quinn",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rand_chacha 0.3.1",
  "rayon",
  "rolling-file",
@@ -5667,7 +5710,7 @@ dependencies = [
  "dlopen2",
  "lazy_static",
  "log",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rayon",
  "serde",
  "solana-hash",
@@ -5904,7 +5947,7 @@ dependencies = [
  "log",
  "lru",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rand_chacha 0.3.1",
  "rayon",
  "serde",
@@ -6087,7 +6130,7 @@ dependencies = [
  "proptest",
  "prost",
  "qualifier_attr",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rand_chacha 0.3.1",
  "rayon",
  "reed-solomon-erasure",
@@ -6283,7 +6326,7 @@ dependencies = [
  "itertools 0.12.1",
  "log",
  "nix",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_derive",
  "socket2",
@@ -6361,7 +6404,7 @@ dependencies = [
  "libc",
  "log",
  "nix",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rayon",
  "serde",
  "solana-hash",
@@ -6466,7 +6509,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "num-derive",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_bytes",
  "serde_derive",
@@ -6579,7 +6622,7 @@ dependencies = [
  "num-derive",
  "num-traits",
  "percentage",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "solana-account",
  "solana-clock",
@@ -6656,7 +6699,7 @@ dependencies = [
  "getrandom 0.2.15",
  "js-sys",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_derive",
  "solana-atomic-u64",
@@ -6984,7 +7027,7 @@ dependencies = [
  "num_enum",
  "percentage",
  "qualifier_attr",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rayon",
  "regex",
  "serde",
@@ -7288,7 +7331,7 @@ version = "2.2.0"
 dependencies = [
  "bs58",
  "ed25519-dalek",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde-big-array",
  "serde_derive",
@@ -7445,7 +7488,7 @@ dependencies = [
  "percentage",
  "quinn",
  "quinn-proto",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rustls 0.23.21",
  "smallvec",
  "socket2",
@@ -7816,7 +7859,7 @@ dependencies = [
  "bincode",
  "lazy_static",
  "log",
- "rand 0.8.5",
+ "rand 0.9.0",
  "solana-packet",
  "solana-perf",
  "solana-short-vec",
@@ -7896,7 +7939,7 @@ dependencies = [
  "log",
  "lru",
  "quinn",
- "rand 0.8.5",
+ "rand 0.9.0",
  "rand_chacha 0.3.1",
  "rayon",
  "rustls 0.23.21",
@@ -7928,7 +7971,7 @@ name = "solana-type-overrides"
 version = "2.2.0"
 dependencies = [
  "lazy_static",
- "rand 0.8.5",
+ "rand 0.9.0",
 ]
 
 [[package]]
@@ -8127,7 +8170,7 @@ dependencies = [
  "merlin",
  "num-derive",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_derive",
  "serde_json",
@@ -8176,7 +8219,7 @@ dependencies = [
  "merlin",
  "num-derive",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.0",
  "serde",
  "serde_derive",
  "serde_json",
@@ -9524,6 +9567,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
+name = "wasi"
+version = "0.13.3+wasi-0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26816d2e1a4a36a2940b96c5296ce403917633dff8f3440e9b236ed6f6bacad2"
+dependencies = [
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9870,6 +9922,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-rt"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3268f3d866458b787f390cf61f4bbb563b922d091359f9608842999eaee3943c"
+dependencies = [
+ "bitflags 2.8.0",
+]
+
+[[package]]
 name = "write16"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9950,7 +10011,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
 dependencies = [
  "byteorder",
- "zerocopy-derive",
+ "zerocopy-derive 0.7.35",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.8.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a367f292d93d4eab890745e75a778da40909cab4d6ff8173693812f79c4a2468"
+dependencies = [
+ "zerocopy-derive 0.8.14",
 ]
 
 [[package]]
@@ -9958,6 +10028,17 @@ name = "zerocopy-derive"
 version = "0.7.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.96",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3931cb58c62c13adec22e38686b559c86a30565e16ad6e8510a337cedc611e1"
 dependencies = [
  "proc-macro2",
  "quote",
