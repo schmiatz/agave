@@ -94,6 +94,8 @@ scp /mnt/ledger/tower-1_9-$(solana-keygen pubkey /home/sol/staked-identity.json)
    
 ```
 #!/bin/bash
+
+# example script of the above steps
 agave-validator -l /mnt/ledger set-identity --require-tower /home/sol/staked-identity.json
 ln -sf /home/sol/staked-identity.json /home/sol/identity.json
 ```
