@@ -18,7 +18,7 @@ You will need:
 
 ## Setup
 
-### Generating Junk Identities
+### Generating a unstaked Secondary Identity
 
 Both validators need to have secondary identities to assume when not actively voting.    
 You can generate these unstaked identities on each of your validators like so:      
