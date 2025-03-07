@@ -19,6 +19,7 @@ use {
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
     solana_nonce::state::State as NonceState,
+    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_pubkey::Pubkey,
     solana_rent::RentDue,
     solana_rent_debits::RentDebits,
@@ -29,7 +30,6 @@ use {
     },
     solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_transaction_context::{IndexOfAccount, TransactionAccount},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::{
@@ -58,17 +58,37 @@ pub(crate) enum TransactionLoadResult {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "dev-context-only-utils", derive(Default))]
+#[cfg_attr(
+    feature = "svm-internal",
+    field_qualifiers(nonce(pub), lamports_per_signature(pub),)
+)]
 pub struct CheckedTransactionDetails {
     pub(crate) nonce: Option<NonceInfo>,
     pub(crate) lamports_per_signature: u64,
+    pub(crate) compute_budget_limits: Result<ComputeBudgetLimits>,
+}
+
+#[cfg(feature = "dev-context-only-utils")]
+impl Default for CheckedTransactionDetails {
+    fn default() -> Self {
+        Self {
+            nonce: None,
+            lamports_per_signature: 0,
+            compute_budget_limits: Ok(ComputeBudgetLimits::default()),
+        }
+    }
 }
 
 impl CheckedTransactionDetails {
-    pub fn new(nonce: Option<NonceInfo>, lamports_per_signature: u64) -> Self {
+    pub fn new(
+        nonce: Option<NonceInfo>,
+        lamports_per_signature: u64,
+        compute_budget_limits: Result<ComputeBudgetLimits>,
+    ) -> Self {
         Self {
             nonce,
             lamports_per_signature,
+            compute_budget_limits,
         }
     }
 }

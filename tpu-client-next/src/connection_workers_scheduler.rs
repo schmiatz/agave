@@ -12,6 +12,7 @@ use {
         workers_cache::{maybe_shutdown_worker, WorkerInfo, WorkersCache, WorkersCacheError},
         SendTransactionStats,
     },
+    async_trait::async_trait,
     log::*,
     quinn::Endpoint,
     solana_keypair::Keypair,
@@ -44,7 +45,7 @@ pub enum ConnectionWorkersSchedulerError {
 /// be targeted when sending transactions and connecting.
 ///
 /// Note, that the unit is number of leaders per
-/// [`NUM_CONSECUTIVE_LEADER_SLOTS`]. It means that if the leader schedule is
+/// [`solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS`]. It means that if the leader schedule is
 /// [L1, L1, L1, L1, L1, L1, L1, L1, L2, L2, L2, L2], the leaders per
 /// consecutive leader slots are [L1, L1, L2], so there are 3 of them.
 ///
@@ -70,7 +71,7 @@ pub struct ConnectionWorkersSchedulerConfig {
 
     /// Optional stake identity keypair used in the endpoint certificate for
     /// identifying the sender.
-    pub stake_identity: Option<Keypair>,
+    pub stake_identity: Option<StakeIdentity>,
 
     /// The number of connections to be maintained by the scheduler.
     pub num_connections: usize,
@@ -90,6 +91,52 @@ pub struct ConnectionWorkersSchedulerConfig {
     pub leaders_fanout: Fanout,
 }
 
+/// The [`StakeIdentity`] structure provides a convenient abstraction for handling
+/// [`Keypair`] when creating a QUIC certificate. Since `Keypair` does not implement
+/// [`Clone`], it cannot be moved in situations where [`ConnectionWorkersSchedulerConfig`]
+/// needs to be transferred. This wrapper structure allows the use of either a `Keypair`
+/// or a `&Keypair` to create a certificate, which is stored internally and later
+/// consumed by [`ConnectionWorkersScheduler`] to create an endpoint.
+pub struct StakeIdentity(QuicClientCertificate);
+
+impl From<Keypair> for StakeIdentity {
+    fn from(keypair: Keypair) -> Self {
+        Self(QuicClientCertificate::new(Some(&keypair)))
+    }
+}
+
+impl From<&Keypair> for StakeIdentity {
+    fn from(keypair: &Keypair) -> Self {
+        Self(QuicClientCertificate::new(Some(keypair)))
+    }
+}
+
+impl From<StakeIdentity> for QuicClientCertificate {
+    fn from(identity: StakeIdentity) -> Self {
+        identity.0
+    }
+}
+
+/// The [`WorkersBroadcaster`] trait defines a customizable mechanism for
+/// sending transaction batches to workers corresponding to the provided list of
+/// addresses. Implementations of this trait are used by the
+/// [`ConnectionWorkersScheduler`] to distribute transactions to workers
+/// accordingly.
+#[async_trait]
+pub trait WorkersBroadcaster {
+    /// Sends a `transaction_batch` to workers associated with the given
+    /// `leaders` addresses.
+    ///
+    /// Returns error if a critical issue occurs, e.g. the implementation
+    /// encounters an unrecoverable error. In this case, it will trigger
+    /// stopping the scheduler and cleaning all the data.
+    async fn send_to_workers(
+        workers: &mut WorkersCache,
+        leaders: &[SocketAddr],
+        transaction_batch: TransactionBatch,
+    ) -> Result<(), ConnectionWorkersSchedulerError>;
+}
+
 pub type TransactionStatsAndReceiver = (
     SendTransactionStatsPerAddr,
     mpsc::Receiver<TransactionBatch>,
@@ -98,6 +145,32 @@ pub type TransactionStatsAndReceiver = (
 impl ConnectionWorkersScheduler {
     /// Starts the scheduler, which manages the distribution of transactions to
     /// the network's upcoming leaders.
+    ///
+    /// This method is a shorthand for
+    /// [`ConnectionWorkersScheduler::run_with_broadcaster`] using
+    /// `NonblockingBroadcaster` strategy.
+    ///
+    /// Transactions that fail to be delivered to workers due to full channels
+    /// will be dropped. The same for transactions that failed to be delivered
+    /// over the network.
+    pub async fn run(
+        config: ConnectionWorkersSchedulerConfig,
+        leader_updater: Box<dyn LeaderUpdater>,
+        transaction_receiver: mpsc::Receiver<TransactionBatch>,
+        cancel: CancellationToken,
+    ) -> Result<TransactionStatsAndReceiver, ConnectionWorkersSchedulerError> {
+        Self::run_with_broadcaster::<NonblockingBroadcaster>(
+            config,
+            leader_updater,
+            transaction_receiver,
+            cancel,
+        )
+        .await
+    }
+
+    /// Starts the scheduler, which manages the distribution of transactions to
+    /// the network's upcoming leaders. `Broadcaster` allows to customize the
+    /// way transactions are send to the leaders, see [`WorkersBroadcaster`].
     ///
     /// Runs the main loop that handles worker scheduling and management for
     /// connections. Returns the error quic statistics per connection address or
@@ -108,7 +181,7 @@ impl ConnectionWorkersScheduler {
     ///
     /// Importantly, if some transactions were not delivered due to network
     /// problems, they will not be retried when the problem is resolved.
-    pub async fn run(
+    pub async fn run_with_broadcaster<Broadcaster: WorkersBroadcaster>(
         ConnectionWorkersSchedulerConfig {
             bind,
             stake_identity,
@@ -122,10 +195,12 @@ impl ConnectionWorkersScheduler {
         mut transaction_receiver: mpsc::Receiver<TransactionBatch>,
         cancel: CancellationToken,
     ) -> Result<TransactionStatsAndReceiver, ConnectionWorkersSchedulerError> {
-        let endpoint = Self::setup_endpoint(bind, stake_identity.as_ref())?;
+        let endpoint = Self::setup_endpoint(bind, stake_identity)?;
         debug!("Client endpoint bind address: {:?}", endpoint.local_addr());
         let mut workers = WorkersCache::new(num_connections, cancel.clone());
         let mut send_stats_per_addr = SendTransactionStatsPerAddr::new();
+
+        let mut last_error = None;
 
         loop {
             let transaction_batch: TransactionBatch = tokio::select! {
@@ -142,49 +217,31 @@ impl ConnectionWorkersScheduler {
                 }
             };
 
-            let updated_leaders = leader_updater.next_leaders(leaders_fanout.connect);
+            let connect_leaders = leader_updater.next_leaders(leaders_fanout.connect);
+            let send_leaders = extract_send_leaders(&connect_leaders, leaders_fanout.send);
 
-            let (fanout_leaders, connect_leaders) =
-                split_leaders(&updated_leaders, &leaders_fanout);
             // add future leaders to the cache to hide the latency of opening
             // the connection.
             for peer in connect_leaders {
-                if !workers.contains(peer) {
+                if !workers.contains(&peer) {
                     let stats = send_stats_per_addr.entry(peer.ip()).or_default();
                     let worker = Self::spawn_worker(
                         &endpoint,
-                        peer,
+                        &peer,
                         worker_channel_size,
                         skip_check_transaction_age,
                         max_reconnect_attempts,
                         stats.clone(),
                     );
-                    maybe_shutdown_worker(workers.push(*peer, worker));
+                    maybe_shutdown_worker(workers.push(peer, worker));
                 }
             }
 
-            for new_leader in fanout_leaders {
-                if !workers.contains(new_leader) {
-                    warn!("No existing worker for {new_leader:?}, skip sending to this leader.");
-                    continue;
-                }
-
-                let send_res =
-                    workers.try_send_transactions_to_address(new_leader, transaction_batch.clone());
-                match send_res {
-                    Ok(()) => (),
-                    Err(WorkersCacheError::ShutdownError) => {
-                        debug!("Connection to {new_leader} was closed, worker cache shutdown");
-                    }
-                    Err(WorkersCacheError::ReceiverDropped) => {
-                        // Remove the worker from the cache, if the peer has disconnected.
-                        maybe_shutdown_worker(workers.pop(*new_leader));
-                    }
-                    Err(err) => {
-                        warn!("Connection to {new_leader} was closed, worker error: {err}");
-                        // If we have failed to send batch, it will be dropped.
-                    }
-                }
+            if let Err(error) =
+                Broadcaster::send_to_workers(&mut workers, &send_leaders, transaction_batch).await
+            {
+                last_error = Some(error);
+                break;
             }
         }
 
@@ -192,15 +249,21 @@ impl ConnectionWorkersScheduler {
 
         endpoint.close(0u32.into(), b"Closing connection");
         leader_updater.stop().await;
+        if let Some(error) = last_error {
+            return Err(error);
+        }
         Ok((send_stats_per_addr, transaction_receiver))
     }
 
     /// Sets up the QUIC endpoint for the scheduler to handle connections.
     fn setup_endpoint(
         bind: SocketAddr,
-        stake_identity: Option<&Keypair>,
+        stake_identity: Option<StakeIdentity>,
     ) -> Result<Endpoint, ConnectionWorkersSchedulerError> {
-        let client_certificate = QuicClientCertificate::new(stake_identity);
+        let client_certificate = match stake_identity {
+            Some(identity) => identity.into(),
+            None => QuicClientCertificate::new(None),
+        };
         let client_config = create_client_config(client_certificate);
         let endpoint = create_client_endpoint(bind, client_config)?;
         Ok(endpoint)
@@ -235,21 +298,62 @@ impl ConnectionWorkersScheduler {
     }
 }
 
-/// Splits `leaders` into two slices based on the `fanout` configuration:
-/// * the first slice contains the leaders to which transactions will be sent,
-/// * the second vector contains the leaders, used to warm up connections. This
-///   slice includes the first set.
-fn split_leaders<'leaders>(
-    leaders: &'leaders [SocketAddr],
-    fanout: &Fanout,
-) -> (&'leaders [SocketAddr], &'leaders [SocketAddr]) {
-    let Fanout { send, connect } = fanout;
-    assert!(send <= connect);
-    let send_count = (*send).min(leaders.len());
-    let connect_count = (*connect).min(leaders.len());
+/// [`NonblockingBroadcaster`] attempts to immediately send transactions to all
+/// the workers. If worker cannot accept transactions because it's channel is
+/// full, the transactions will not be sent to this worker.
+struct NonblockingBroadcaster;
 
-    let send_slice = &leaders[..send_count];
-    let connect_slice = &leaders[..connect_count];
+#[async_trait]
+impl WorkersBroadcaster for NonblockingBroadcaster {
+    async fn send_to_workers(
+        workers: &mut WorkersCache,
+        leaders: &[SocketAddr],
+        transaction_batch: TransactionBatch,
+    ) -> Result<(), ConnectionWorkersSchedulerError> {
+        for new_leader in leaders {
+            if !workers.contains(new_leader) {
+                warn!("No existing worker for {new_leader:?}, skip sending to this leader.");
+                continue;
+            }
 
-    (send_slice, connect_slice)
+            let send_res =
+                workers.try_send_transactions_to_address(new_leader, transaction_batch.clone());
+            match send_res {
+                Ok(()) => (),
+                Err(WorkersCacheError::ShutdownError) => {
+                    debug!("Connection to {new_leader} was closed, worker cache shutdown");
+                }
+                Err(WorkersCacheError::ReceiverDropped) => {
+                    // Remove the worker from the cache, if the peer has disconnected.
+                    maybe_shutdown_worker(workers.pop(*new_leader));
+                }
+                Err(err) => {
+                    warn!("Connection to {new_leader} was closed, worker error: {err}");
+                    // If we have failed to send batch, it will be dropped.
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Extracts a list of unique leader addresses to which transactions will be sent.
+///
+/// This function selects up to `send_fanout` addresses from the `leaders` list, ensuring that
+/// only unique addresses are included while maintaining their original order.
+fn extract_send_leaders(leaders: &[SocketAddr], send_fanout: usize) -> Vec<SocketAddr> {
+    let send_count = send_fanout.min(leaders.len());
+    remove_duplicates(&leaders[..send_count])
+}
+
+/// Removes duplicate `SocketAddr` elements from the given slice while
+/// preserving their original order.
+fn remove_duplicates(input: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut res = Vec::with_capacity(input.len());
+    for address in input {
+        if !res.contains(address) {
+            res.push(*address);
+        }
+    }
+    res
 }

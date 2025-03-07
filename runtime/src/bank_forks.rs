@@ -18,6 +18,7 @@ use {
         clock::{BankId, Slot},
         hash::Hash,
     },
+    solana_unified_scheduler_logic::SchedulingMode,
     std::{
         collections::{hash_map::Entry, HashMap, HashSet},
         ops::Index,
@@ -32,6 +33,7 @@ use {
 
 pub const MAX_ROOT_DISTANCE_FOR_VOTE_ONLY: Slot = 400;
 pub type AtomicSlot = AtomicU64;
+#[derive(Clone)]
 pub struct ReadOnlyAtomicSlot {
     slot: Arc<AtomicSlot>,
 }
@@ -226,17 +228,32 @@ impl BankForks {
         );
     }
 
-    pub fn insert(&mut self, mut bank: Bank) -> BankWithScheduler {
+    pub fn insert(&mut self, bank: Bank) -> BankWithScheduler {
+        self.insert_with_scheduling_mode(SchedulingMode::BlockVerification, bank)
+    }
+
+    pub fn insert_with_scheduling_mode(
+        &mut self,
+        mode: SchedulingMode,
+        mut bank: Bank,
+    ) -> BankWithScheduler {
         if self.root.load(Ordering::Relaxed) < self.highest_slot_at_startup {
             bank.set_check_program_modification_slot(true);
         }
 
         let bank = Arc::new(bank);
         let bank = if let Some(scheduler_pool) = &self.scheduler_pool {
-            let context = SchedulingContext::new(bank.clone());
+            let context = SchedulingContext::new_with_mode(mode, bank.clone());
             let scheduler = scheduler_pool.take_scheduler(context);
             let bank_with_scheduler = BankWithScheduler::new(bank, Some(scheduler));
-            scheduler_pool.register_timeout_listener(bank_with_scheduler.create_timeout_listener());
+            // Skip registering for block production. Both the tvu main loop in the replay stage
+            // and PohRecorder don't support _concurrent block production_ at all. It's strongly
+            // assumed that block is produced in singleton way and it's actually desired, while
+            // ignoring the opportunity cost of (hopefully rare!) fork switching...
+            if matches!(mode, SchedulingMode::BlockVerification) {
+                scheduler_pool
+                    .register_timeout_listener(bank_with_scheduler.create_timeout_listener());
+            }
             bank_with_scheduler
         } else {
             BankWithScheduler::new_without_scheduler(bank)
@@ -400,11 +417,7 @@ impl BankForks {
         let new_epoch = root_bank.epoch();
         if old_epoch != new_epoch {
             info!(
-                "Root entering
-                    epoch: {},
-                    next_epoch_start_slot: {},
-                    epoch_stakes: {:#?}",
-                new_epoch,
+                "Root entering epoch: {new_epoch}, next_epoch_start_slot: {}, epoch_stakes: {:#?}",
                 root_bank
                     .epoch_schedule()
                     .get_first_slot_in_epoch(new_epoch + 1),

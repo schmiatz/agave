@@ -109,7 +109,7 @@ command_step() {
     timeout_in_minutes: $3
     artifact_paths: "log-*.txt"
     agents:
-      queue: "sol-private"
+      queue: "default"
 EOF
 }
 
@@ -138,7 +138,7 @@ all_test_steps() {
   wait_step
 
   # Full test suite
-  .buildkite/scripts/build-stable.sh sol-private >> "$output_file"
+  .buildkite/scripts/build-stable.sh default >> "$output_file"
 
   # Docs tests
   if affects \
@@ -166,15 +166,13 @@ all_test_steps() {
              ^fetch-perf-libs.sh \
              ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
       ; then
     cat >> "$output_file" <<"EOF"
   - command: "ci/docker-run-default-image.sh ci/test-stable-sbf.sh"
     name: "stable-sbf"
     timeout_in_minutes: 35
-    artifact_paths: "sbf-dumps.tar.bz2"
     agents:
-      queue: "sol-private"
+      queue: "default"
 EOF
   else
     annotate --style info \
@@ -194,26 +192,13 @@ EOF
              ^fetch-perf-libs.sh \
              ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
              ^ci/downstream-projects \
              .buildkite/scripts/build-downstream-projects.sh \
       ; then
-    .buildkite/scripts/build-downstream-projects.sh sol-private >> "$output_file"
+    .buildkite/scripts/build-downstream-projects.sh default >> "$output_file"
   else
     annotate --style info \
       "downstream-projects skipped as no relevant files were modified"
-  fi
-
-  # Wasm support
-  if affects \
-             ^ci/test-wasm.sh \
-             ^ci/test-stable.sh \
-             ^sdk/ \
-      ; then
-    command_step wasm "ci/docker-run-default-image.sh ci/test-wasm.sh" 20
-  else
-    annotate --style info \
-      "wasm skipped as no relevant files were modified"
   fi
 
   # Coverage...

@@ -11,13 +11,13 @@ use {
     solana_accounts_db::epoch_accounts_hash::EpochAccountsHash,
     solana_banks_client::start_client,
     solana_banks_server::banks_server::start_local_server,
-    solana_bpf_loader_program::serialization::serialize_parameters,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_feature_set::FEATURE_NAMES,
     solana_instruction::{error::InstructionError, Instruction},
     solana_log_collector::ic_msg,
     solana_program_runtime::{
-        invoke_context::BuiltinFunctionWithContext, loaded_programs::ProgramCacheEntry, stable_log,
+        invoke_context::BuiltinFunctionWithContext, loaded_programs::ProgramCacheEntry,
+        serialization::serialize_parameters, stable_log,
     },
     solana_runtime::{
         accounts_background_service::{AbsRequestSender, SnapshotRequestKind},
@@ -815,7 +815,7 @@ impl ProgramTest {
             bootstrap_validator_stake_lamports,
             42,
             fee_rate_governor,
-            rent,
+            rent.clone(),
             ClusterType::Development,
             std::mem::take(&mut self.genesis_accounts),
         );
@@ -866,7 +866,16 @@ impl ProgramTest {
         );
 
         // Add commonly-used SPL programs as a convenience to the user
-        for (program_id, account) in programs::spl_programs(&Rent::default()).iter() {
+        for (program_id, account) in programs::spl_programs(&rent).iter() {
+            bank.store_account(program_id, account);
+        }
+
+        // Add migrated Core BPF programs.
+        for (program_id, account) in programs::core_bpf_programs(&rent, |feature_id| {
+            genesis_config.accounts.contains_key(feature_id)
+        })
+        .iter()
+        {
             bank.store_account(program_id, account);
         }
 

@@ -23,7 +23,7 @@ use {
         },
         loader_utils::{
             create_program, instructions_to_load_program_of_loader_v4, load_program_from_file,
-            load_program_of_loader_v4, load_upgradeable_buffer, load_upgradeable_program,
+            load_program_of_loader_v4, load_upgradeable_buffer,
         },
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
@@ -1266,17 +1266,17 @@ fn assert_instruction_count() {
     #[cfg(feature = "sbf_c")]
     {
         programs.extend_from_slice(&[
-            ("alloc", 14575),
-            ("sbf_to_sbf", 313),
-            ("multiple_static", 208),
-            ("noop", 5),
-            ("noop++", 5),
-            ("relative_call", 210),
-            ("return_data", 980),
-            ("sanity", 2377),
-            ("sanity++", 2277),
-            ("secp256k1_recover", 25383),
-            ("sha", 1355),
+            ("alloc", 19332),
+            ("sbf_to_sbf", 316),
+            ("multiple_static", 210),
+            ("noop", 6),
+            ("noop++", 6),
+            ("relative_call", 212),
+            ("return_data", 1027),
+            ("sanity", 2394),
+            ("sanity++", 2294),
+            ("secp256k1_recover", 25483),
+            ("sha", 1447),
             ("struct_pass", 108),
             ("struct_ret", 122),
         ]);
@@ -1284,20 +1284,20 @@ fn assert_instruction_count() {
     #[cfg(feature = "sbf_rust")]
     {
         programs.extend_from_slice(&[
-            ("solana_sbf_rust_128bit", 1218),
-            ("solana_sbf_rust_alloc", 5077),
-            ("solana_sbf_rust_custom_heap", 398),
+            ("solana_sbf_rust_128bit", 955),
+            ("solana_sbf_rust_alloc", 4940),
+            ("solana_sbf_rust_custom_heap", 286),
             ("solana_sbf_rust_dep_crate", 2),
             ("solana_sbf_rust_iter", 1514),
-            ("solana_sbf_rust_many_args", 1289),
-            ("solana_sbf_rust_mem", 2067),
-            ("solana_sbf_rust_membuiltins", 1539),
+            ("solana_sbf_rust_many_args", 1290),
+            ("solana_sbf_rust_mem", 1302),
+            ("solana_sbf_rust_membuiltins", 327),
             ("solana_sbf_rust_noop", 275),
-            ("solana_sbf_rust_param_passing", 146),
-            ("solana_sbf_rust_rand", 378),
-            ("solana_sbf_rust_sanity", 51953),
-            ("solana_sbf_rust_secp256k1_recover", 91185),
-            ("solana_sbf_rust_sha", 24059),
+            ("solana_sbf_rust_param_passing", 108),
+            ("solana_sbf_rust_rand", 278),
+            ("solana_sbf_rust_sanity", 51325),
+            ("solana_sbf_rust_secp256k1_recover", 89388),
+            ("solana_sbf_rust_sha", 22850),
         ]);
     }
 
@@ -1491,7 +1491,8 @@ fn test_program_sbf_invoke_stable_genesis_and_bank() {
         TransactionError::ProgramAccountNotFound
     );
 
-    load_upgradeable_program(
+    #[allow(deprecated)]
+    solana_runtime::loader_utils::load_upgradeable_program(
         &bank_client,
         &mint_keypair,
         &buffer_keypair,
@@ -1504,7 +1505,8 @@ fn test_program_sbf_invoke_stable_genesis_and_bank() {
     let indirect_program_keypair = Keypair::from_base58_string(
         "2BgE4gD5wUCwiAVPYbmWd2xzXSsD9W2fWgNjwmVkm8WL7i51vK9XAXNnX1VB6oKQZmjaUPRd5RzE6RggB9DeKbZC",
     );
-    load_upgradeable_program(
+    #[allow(deprecated)]
+    solana_runtime::loader_utils::load_upgradeable_program(
         &bank_client,
         &mint_keypair,
         &buffer_keypair,
@@ -1695,10 +1697,15 @@ fn test_program_sbf_invoke_in_same_tx_as_deployment() {
             );
         } else {
             let (result, _, _, _) = process_transaction_and_record_inner(&bank, tx);
-            assert_eq!(
-                result.unwrap_err(),
-                TransactionError::InstructionError(38, InstructionError::UnsupportedProgramId),
-            );
+            if let TransactionError::InstructionError(instr_no, ty) = result.unwrap_err() {
+                // Asserting the instruction number as an upper bound, since the quantity of
+                // instructions depends on the program size, which in turn depends on the SBPF
+                // versions.
+                assert!(instr_no <= 39);
+                assert_eq!(ty, InstructionError::UnsupportedProgramId);
+            } else {
+                panic!("Invalid error type");
+            }
         }
     }
 }
@@ -1738,12 +1745,9 @@ fn test_program_sbf_invoke_in_same_tx_as_redeployment() {
     let deployment_instruction = deployment_instructions.pop().unwrap();
     let signers: &[&[&Keypair]] = &[
         &[&mint_keypair, &source_program_keypair],
-        &[&mint_keypair, &source_program_keypair, &authority_keypair],
         &[&mint_keypair, &authority_keypair],
     ];
-    let signers = std::iter::once(signers[0])
-        .chain(std::iter::once(signers[1]))
-        .chain(std::iter::repeat(signers[2]));
+    let signers = std::iter::once(signers[0]).chain(std::iter::repeat(signers[1]));
     for (instruction, signers) in deployment_instructions.into_iter().zip(signers) {
         let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
         bank_client
@@ -2065,16 +2069,9 @@ fn test_program_sbf_upgrade() {
     );
     let signers: &[&[&Keypair]] = &[
         &[&mint_keypair, &source_program_keypair],
-        &[
-            &mint_keypair,
-            &source_program_keypair,
-            &new_authority_keypair,
-        ],
         &[&mint_keypair, &new_authority_keypair],
     ];
-    let signers = std::iter::once(signers[0])
-        .chain(std::iter::once(signers[1]))
-        .chain(std::iter::repeat(signers[2]));
+    let signers = std::iter::once(signers[0]).chain(std::iter::repeat(signers[1]));
     for (instruction, signers) in deployment_instructions.into_iter().zip(signers) {
         let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
         bank_client
@@ -2179,16 +2176,9 @@ fn test_program_sbf_upgrade_via_cpi() {
     let mut upgrade_instruction = deployment_instructions.pop().unwrap();
     let signers: &[&[&Keypair]] = &[
         &[&mint_keypair, &source_program_keypair],
-        &[
-            &mint_keypair,
-            &source_program_keypair,
-            &new_authority_keypair,
-        ],
         &[&mint_keypair, &new_authority_keypair],
     ];
-    let signers = std::iter::once(signers[0])
-        .chain(std::iter::once(signers[1]))
-        .chain(std::iter::repeat(signers[2]));
+    let signers = std::iter::once(signers[0]).chain(std::iter::repeat(signers[1]));
     for (instruction, signers) in deployment_instructions.into_iter().zip(signers) {
         let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
         bank_client
@@ -3971,7 +3961,7 @@ fn test_cpi_deprecated_loader_realloc() {
         if direct_mapping {
             assert_eq!(
                 result.unwrap_err().unwrap(),
-                TransactionError::InstructionError(0, InstructionError::InvalidRealloc)
+                TransactionError::InstructionError(0, InstructionError::ProgramFailedToComplete)
             );
         } else {
             assert_eq!(
@@ -5161,7 +5151,7 @@ fn test_mem_syscalls_overlap_account_begin_or_end() {
         let mut bank_client = BankClient::new_shared(bank);
         let authority_keypair = Keypair::new();
 
-        let (bank, program_id) = load_program_of_loader_v4(
+        let (bank, loader_v4_program_id) = load_program_of_loader_v4(
             &mut bank_client,
             &bank_forks,
             &mint_keypair,
@@ -5169,30 +5159,68 @@ fn test_mem_syscalls_overlap_account_begin_or_end() {
             "solana_sbf_rust_account_mem",
         );
 
+        let deprecated_program_id = create_program(
+            &bank,
+            &bpf_loader_deprecated::id(),
+            "solana_sbf_rust_account_mem_deprecated",
+        );
+
         let mint_pubkey = mint_keypair.pubkey();
-        let account_metas = vec![
-            AccountMeta::new(mint_pubkey, true),
-            AccountMeta::new_readonly(program_id, false),
-            AccountMeta::new(account_keypair.pubkey(), false),
-        ];
 
-        let account = AccountSharedData::new(42, 1024, &program_id);
-        bank.store_account(&account_keypair.pubkey(), &account);
+        for deprecated in [false, true] {
+            let program_id = if deprecated {
+                deprecated_program_id
+            } else {
+                loader_v4_program_id
+            };
 
-        for instr in 0..=15 {
-            println!("Testing direct_mapping:{direct_mapping} instruction:{instr}");
-            let instruction =
-                Instruction::new_with_bytes(program_id, &[instr], account_metas.clone());
+            let account_metas = vec![
+                AccountMeta::new(mint_pubkey, true),
+                AccountMeta::new_readonly(program_id, false),
+                AccountMeta::new(account_keypair.pubkey(), false),
+            ];
 
-            let message = Message::new(&[instruction], Some(&mint_pubkey));
-            let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
-            let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+            let account = AccountSharedData::new(42, 1024, &program_id);
+            bank.store_account(&account_keypair.pubkey(), &account);
 
-            if direct_mapping {
-                assert!(logs.last().unwrap().ends_with(" failed: InvalidLength"));
-            } else if result.is_err() {
-                // without direct mapping, we should never get the InvalidLength error
-                assert!(!logs.last().unwrap().ends_with(" failed: InvalidLength"));
+            for instr in 0..=15 {
+                println!("Testing deprecated:{deprecated} direct_mapping:{direct_mapping} instruction:{instr}");
+                let instruction =
+                    Instruction::new_with_bytes(program_id, &[instr], account_metas.clone());
+
+                let message = Message::new(&[instruction], Some(&mint_pubkey));
+                let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+                let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+
+                if direct_mapping {
+                    assert!(logs.last().unwrap().ends_with(" failed: InvalidLength"));
+                } else if result.is_err() {
+                    // without direct mapping, we should never get the InvalidLength error
+                    assert!(!logs.last().unwrap().ends_with(" failed: InvalidLength"));
+                }
+            }
+
+            let account = AccountSharedData::new(42, 0, &program_id);
+            bank.store_account(&account_keypair.pubkey(), &account);
+
+            for instr in 0..=15 {
+                println!("Testing deprecated:{deprecated} direct_mapping:{direct_mapping} instruction:{instr} zero-length account");
+                let instruction =
+                    Instruction::new_with_bytes(program_id, &[instr, 0], account_metas.clone());
+
+                let message = Message::new(&[instruction], Some(&mint_pubkey));
+                let tx = Transaction::new(&[&mint_keypair], message.clone(), bank.last_blockhash());
+                let (result, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+
+                if direct_mapping && !deprecated {
+                    // we have a resize area
+                    assert!(
+                        logs.last().unwrap().ends_with(" failed: InvalidLength"),
+                        "{logs:?}"
+                    );
+                } else {
+                    assert!(result.is_ok(), "{logs:?}");
+                }
             }
         }
     }

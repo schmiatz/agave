@@ -18,7 +18,9 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
-    solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4},
+    solana_sdk_ids::{
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, system_program,
+    },
     solana_transaction_context::{BorrowedAccount, InstructionContext},
     solana_type_overrides::sync::{atomic::Ordering, Arc},
     std::{cell::RefCell, rc::Rc},
@@ -178,7 +180,7 @@ fn process_instruction_copy(
     Ok(())
 }
 
-fn process_instruction_truncate(
+fn process_instruction_set_program_length(
     invoke_context: &mut InvokeContext,
     new_size: u32,
 ) -> Result<(), InstructionError> {
@@ -199,10 +201,6 @@ fn process_instruction_truncate(
         if !program.is_writable() {
             ic_logger_msg!(log_collector, "Program is not writeable");
             return Err(InstructionError::InvalidArgument);
-        }
-        if !program.is_signer() {
-            ic_logger_msg!(log_collector, "Program did not sign");
-            return Err(InstructionError::MissingRequiredSignature);
         }
         if !instruction_context.is_instruction_account_signer(1)? {
             ic_logger_msg!(log_collector, "Authority did not sign");
@@ -237,15 +235,24 @@ fn process_instruction_truncate(
             return Err(InstructionError::InsufficientFunds);
         }
         std::cmp::Ordering::Greater => {
-            let mut recipient =
-                instruction_context.try_borrow_instruction_account(transaction_context, 2)?;
-            if !instruction_context.is_instruction_account_writable(2)? {
-                ic_logger_msg!(log_collector, "Recipient is not writeable");
+            let recipient = instruction_context
+                .try_borrow_instruction_account(transaction_context, 2)
+                .ok();
+            if let Some(mut recipient) = recipient {
+                if !instruction_context.is_instruction_account_writable(2)? {
+                    ic_logger_msg!(log_collector, "Recipient is not writeable");
+                    return Err(InstructionError::InvalidArgument);
+                }
+                let lamports_to_receive = program.get_lamports().saturating_sub(required_lamports);
+                program.checked_sub_lamports(lamports_to_receive)?;
+                recipient.checked_add_lamports(lamports_to_receive)?;
+            } else if new_size == 0 {
+                ic_logger_msg!(
+                    log_collector,
+                    "Closing a program requires a recipient account"
+                );
                 return Err(InstructionError::InvalidArgument);
             }
-            let lamports_to_receive = program.get_lamports().saturating_sub(required_lamports);
-            program.checked_sub_lamports(lamports_to_receive)?;
-            recipient.checked_add_lamports(lamports_to_receive)?;
         }
         std::cmp::Ordering::Equal => {}
     }
@@ -329,13 +336,13 @@ fn process_instruction_deploy(invoke_context: &mut InvokeContext) -> Result<(), 
     );
 
     if let Some(mut source_program) = source_program {
-        let rent = invoke_context.get_sysvar_cache().get_rent()?;
-        let required_lamports = rent.minimum_balance(source_program.get_data().len());
-        let transfer_lamports = required_lamports.saturating_sub(program.get_lamports());
         program.set_data_from_slice(source_program.get_data())?;
         source_program.set_data_length(0)?;
-        source_program.checked_sub_lamports(transfer_lamports)?;
-        program.checked_add_lamports(transfer_lamports)?;
+        let dst_lamports = program.get_lamports();
+        let src_lamports = source_program.get_lamports();
+        source_program.set_lamports(dst_lamports)?;
+        program.set_lamports(src_lamports)?;
+        source_program.set_owner(&system_program::id().to_bytes())?;
     }
     let state = get_state_mut(program.get_data_mut()?)?;
     state.slot = current_slot;
@@ -498,8 +505,8 @@ fn process_instruction_inner(
             } => {
                 process_instruction_copy(invoke_context, destination_offset, source_offset, length)
             }
-            LoaderV4Instruction::Truncate { new_size } => {
-                process_instruction_truncate(invoke_context, new_size)
+            LoaderV4Instruction::SetProgramLength { new_size } => {
+                process_instruction_set_program_length(invoke_context, new_size)
             }
             LoaderV4Instruction::Deploy => process_instruction_deploy(invoke_context),
             LoaderV4Instruction::Retract => process_instruction_retract(invoke_context),
@@ -1011,7 +1018,7 @@ mod tests {
         // No change
         let accounts = process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate {
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
                     .data()
@@ -1036,7 +1043,7 @@ mod tests {
             .set_lamports(smaller_program_lamports);
         let accounts = process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate {
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
                     .data()
@@ -1060,7 +1067,7 @@ mod tests {
             .set_lamports(larger_program_lamports);
         let accounts = process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate {
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[4]
                     .1
                     .data()
@@ -1078,10 +1085,10 @@ mod tests {
             transaction_accounts[4].1.data().len(),
         );
 
-        // Decrease program account size
+        // Decrease program account size, with a recipient
         let accounts = process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate {
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
                     .data()
@@ -1108,10 +1115,32 @@ mod tests {
             ),
         );
 
+        // Decrease program account size, without a recipient
+        let accounts = process_instruction(
+            vec![],
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
+                new_size: transaction_accounts[0]
+                    .1
+                    .data()
+                    .len()
+                    .saturating_sub(LoaderV4State::program_data_offset())
+                    as u32,
+            })
+            .unwrap(),
+            transaction_accounts.clone(),
+            &[(4, false, true), (1, true, false)],
+            Ok(()),
+        );
+        assert_eq!(
+            accounts[4].data().len(),
+            transaction_accounts[0].1.data().len(),
+        );
+        assert_eq!(accounts[2].lamports(), transaction_accounts[2].1.lamports(),);
+
         // Close program account
         let accounts = process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 0 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false), (2, false, true)],
             Ok(()),
@@ -1130,7 +1159,7 @@ mod tests {
         // Error: Program not owned by loader
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 8 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(1, false, true), (1, true, false), (2, true, true)],
             Err(InstructionError::InvalidAccountOwner),
@@ -1139,25 +1168,25 @@ mod tests {
         // Error: Program is not writeable
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 8 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, false), (1, true, false), (2, true, true)],
             Err(InstructionError::InvalidArgument),
         );
 
-        // Error: Program did not sign
+        // Error: Close program account without a recipient
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 8 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
-            &[(3, false, true), (1, true, false), (2, true, true)],
-            Err(InstructionError::MissingRequiredSignature),
+            &[(0, false, true), (1, true, false)],
+            Err(InstructionError::InvalidArgument),
         );
 
         // Error: Authority did not sign
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 8 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, true, true), (1, false, false), (2, true, true)],
             Err(InstructionError::MissingRequiredSignature),
@@ -1166,7 +1195,7 @@ mod tests {
         // Error: Program is and stays uninitialized
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 0 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, true), (1, true, false), (2, true, true)],
             Err(InstructionError::AccountDataTooSmall),
@@ -1175,25 +1204,16 @@ mod tests {
         // Error: Program is not retracted
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 8 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(5, false, true), (1, true, false), (2, false, true)],
             Err(InstructionError::InvalidArgument),
         );
 
-        // Error: Missing recipient account
-        process_instruction(
-            vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 0 }).unwrap(),
-            transaction_accounts.clone(),
-            &[(0, true, true), (1, true, false)],
-            Err(InstructionError::NotEnoughAccountKeys),
-        );
-
         // Error: Recipient is not writeable
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate { new_size: 0 }).unwrap(),
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false), (2, false, false)],
             Err(InstructionError::InvalidArgument),
@@ -1202,7 +1222,7 @@ mod tests {
         // Error: Insufficient funds
         process_instruction(
             vec![],
-            &bincode::serialize(&LoaderV4Instruction::Truncate {
+            &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[4]
                     .1
                     .data()
@@ -1216,7 +1236,9 @@ mod tests {
             Err(InstructionError::InsufficientFunds),
         );
 
-        test_loader_instruction_general_errors(LoaderV4Instruction::Truncate { new_size: 0 });
+        test_loader_instruction_general_errors(LoaderV4Instruction::SetProgramLength {
+            new_size: 0,
+        });
     }
 
     #[test]
@@ -1312,20 +1334,14 @@ mod tests {
             &[(0, false, true), (1, true, false), (2, false, true)],
             Ok(()),
         );
-        transaction_accounts[0].1 = accounts[0].clone();
         assert_eq!(
             accounts[0].data().len(),
             transaction_accounts[2].1.data().len(),
         );
         assert_eq!(accounts[2].data().len(), 0,);
-        assert_eq!(
-            accounts[2].lamports(),
-            transaction_accounts[2].1.lamports().saturating_sub(
-                accounts[0]
-                    .lamports()
-                    .saturating_sub(transaction_accounts[0].1.lamports())
-            ),
-        );
+        assert_eq!(accounts[0].lamports(), transaction_accounts[2].1.lamports());
+        assert_eq!(accounts[2].lamports(), transaction_accounts[0].1.lamports());
+        transaction_accounts[0].1 = accounts[0].clone();
 
         // Error: Program was deployed recently, cooldown still in effect
         process_instruction(

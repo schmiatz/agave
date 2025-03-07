@@ -77,6 +77,37 @@ impl Shredder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn make_merkle_shreds_from_entries(
+        &self,
+        keypair: &Keypair,
+        entries: &[Entry],
+        is_last_in_slot: bool,
+        chained_merkle_root: Option<Hash>,
+        next_shred_index: u32,
+        next_code_index: u32,
+        reed_solomon_cache: &ReedSolomonCache,
+        stats: &mut ProcessShredsStats,
+    ) -> impl Iterator<Item = Shred> {
+        shred::make_merkle_shreds_from_entries(
+            &PAR_THREAD_POOL,
+            keypair,
+            entries,
+            self.slot,
+            self.parent_slot,
+            self.version,
+            self.reference_tick,
+            is_last_in_slot,
+            chained_merkle_root,
+            next_shred_index,
+            next_code_index,
+            reed_solomon_cache,
+            stats,
+        )
+        .unwrap()
+    }
+
+    // For legacy tests and benchmarks.
+    #[allow(clippy::too_many_arguments)]
     pub fn entries_to_shreds(
         &self,
         keypair: &Keypair,
@@ -93,24 +124,18 @@ impl Shredder {
         Vec<Shred>, // coding shreds
     ) {
         if merkle_variant {
-            return shred::make_merkle_shreds_from_entries(
-                &PAR_THREAD_POOL,
-                keypair,
-                entries,
-                self.slot,
-                self.parent_slot,
-                self.version,
-                self.reference_tick,
-                is_last_in_slot,
-                chained_merkle_root,
-                next_shred_index,
-                next_code_index,
-                reed_solomon_cache,
-                stats,
-            )
-            .unwrap()
-            .into_iter()
-            .partition(Shred::is_data);
+            return self
+                .make_merkle_shreds_from_entries(
+                    keypair,
+                    entries,
+                    is_last_in_slot,
+                    chained_merkle_root,
+                    next_shred_index,
+                    next_code_index,
+                    reed_solomon_cache,
+                    stats,
+                )
+                .partition(Shred::is_data);
         }
         let data_shreds =
             self.entries_to_data_shreds(keypair, entries, is_last_in_slot, next_shred_index, stats);
@@ -304,7 +329,7 @@ impl Shredder {
         let data: Vec<_> = data
             .iter()
             .map(Borrow::borrow)
-            .map(Shred::erasure_shard_as_slice)
+            .map(Shred::erasure_shard)
             .collect::<Result<_, _>>()
             .unwrap();
         let mut parity = vec![vec![0u8; data[0].len()]; num_coding];
@@ -372,7 +397,7 @@ impl Shredder {
                 Ok(index) if index < fec_set_size => index,
                 _ => return Err(Error::from(InvalidIndex)),
             };
-            shards[index] = Some(shred.erasure_shard()?);
+            shards[index] = Some(shred.erasure_shard()?.to_vec());
             if index < num_data_shreds {
                 mask[index] = true;
             }

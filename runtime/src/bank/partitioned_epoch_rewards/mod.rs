@@ -5,7 +5,10 @@ mod sysvar;
 
 use {
     super::Bank,
-    crate::{stake_account::StakeAccount, stake_history::StakeHistory},
+    crate::{
+        inflation_rewards::points::PointValue, stake_account::StakeAccount,
+        stake_history::StakeHistory,
+    },
     solana_accounts_db::{
         partitioned_rewards::PartitionedEpochRewardsConfig, stake_rewards::StakeReward,
     },
@@ -15,7 +18,6 @@ use {
         reward_info::RewardInfo,
         stake::state::{Delegation, Stake},
     },
-    solana_stake_program::points::PointValue,
     solana_vote::vote_account::VoteAccounts,
     std::sync::Arc,
 };
@@ -24,21 +26,21 @@ use {
 /// Distributing rewards to stake accounts begins AFTER this many blocks.
 const REWARD_CALCULATION_NUM_BLOCKS: u64 = 1;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PartitionedStakeReward {
     /// Stake account address
     pub stake_pubkey: Pubkey,
     /// `Stake` state to be stored in account
     pub stake: Stake,
-    /// RewardInfo for recording in the Bank on distribution. Most of these
-    /// fields are available on calculation, but RewardInfo::post_balance must
-    /// be updated based on current account state before recording.
-    pub stake_reward_info: RewardInfo,
+    /// Stake reward for recording in the Bank on distribution
+    pub stake_reward: u64,
+    /// Vote commission for recording reward info
+    pub commission: u8,
 }
 
 type PartitionedStakeRewards = Vec<PartitionedStakeReward>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StartBlockHeightAndRewards {
     /// the block height of the slot at which rewards distribution began
     pub(crate) distribution_starting_block_height: u64,
@@ -47,7 +49,7 @@ pub(crate) struct StartBlockHeightAndRewards {
 }
 
 /// Represent whether bank is in the reward phase or not.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) enum EpochRewardStatus {
     /// this bank is in the reward phase.
     /// Contents are the start point for epoch reward calculation,
@@ -252,10 +254,8 @@ mod tests {
             transaction::Transaction,
             vote::state::{VoteStateVersions, MAX_LOCKOUT_HISTORY},
         },
-        solana_vote_program::{
-            vote_state::{self, TowerSync},
-            vote_transaction,
-        },
+        solana_vote::vote_transaction,
+        solana_vote_program::vote_state::{self, TowerSync},
     };
 
     impl PartitionedStakeReward {
@@ -266,7 +266,8 @@ mod tests {
                 Some(Self {
                     stake_pubkey: stake_reward.stake_pubkey,
                     stake,
-                    stake_reward_info: stake_reward.stake_reward_info,
+                    stake_reward: stake_reward.stake_reward_info.lamports as u64,
+                    commission: stake_reward.stake_reward_info.commission.unwrap(),
                 })
             } else {
                 None

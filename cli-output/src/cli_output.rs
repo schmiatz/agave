@@ -18,7 +18,7 @@ use {
     serde_json::{Map, Value},
     solana_account::ReadableAccount,
     solana_account_decoder::{
-        encode_ui_account, parse_account_data::AccountAdditionalDataV2,
+        encode_ui_account, parse_account_data::AccountAdditionalDataV3,
         parse_token::UiTokenAccount, UiAccountEncoding, UiDataSliceConfig,
     },
     solana_clap_utils::keypair::SignOnly,
@@ -158,7 +158,7 @@ pub struct CliAccount {
 
 pub struct CliAccountNewConfig {
     pub data_encoding: UiAccountEncoding,
-    pub additional_data: Option<AccountAdditionalDataV2>,
+    pub additional_data: Option<AccountAdditionalDataV3>,
     pub data_slice_config: Option<UiDataSliceConfig>,
     pub use_lamports_unit: bool,
 }
@@ -2463,6 +2463,25 @@ impl fmt::Display for CliUpgradeableProgramExtended {
             f,
             "Extended Program Id {} by {} bytes",
             &self.program_id, self.additional_bytes,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliUpgradeableProgramMigrated {
+    pub program_id: String,
+}
+impl QuietDisplay for CliUpgradeableProgramMigrated {}
+impl VerboseDisplay for CliUpgradeableProgramMigrated {}
+impl fmt::Display for CliUpgradeableProgramMigrated {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Migrated Program Id {} from loader-v3 to loader-v4",
+            &self.program_id,
         )?;
         Ok(())
     }

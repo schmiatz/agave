@@ -19,8 +19,10 @@ use {
     solana_cli_output::OutputFormat,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
-        blockstore::{Blockstore, PurgeType},
-        blockstore_db::{Column, ColumnName},
+        blockstore::{
+            column::{Column, ColumnName},
+            Blockstore, PurgeType,
+        },
         blockstore_options::AccessType,
         shred::Shred,
     },
@@ -29,6 +31,7 @@ use {
         hash::Hash,
     },
     std::{
+        borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap},
         fs::File,
         io::{stdout, BufRead, BufReader, Write},
@@ -110,7 +113,7 @@ fn analyze_column(blockstore: &Blockstore, column_name: &str) -> Result<()> {
 }
 
 fn analyze_storage(blockstore: &Blockstore) -> Result<()> {
-    use solana_ledger::blockstore_db::columns::*;
+    use solana_ledger::blockstore::column::columns::*;
     analyze_column(blockstore, SlotMeta::NAME)?;
     analyze_column(blockstore, Orphans::NAME)?;
     analyze_column(blockstore, DeadSlots::NAME)?;
@@ -134,7 +137,7 @@ fn analyze_storage(blockstore: &Blockstore) -> Result<()> {
 }
 
 fn raw_key_to_slot(key: &[u8], column_name: &str) -> Option<Slot> {
-    use solana_ledger::blockstore_db::columns as cf;
+    use solana_ledger::blockstore::column::columns as cf;
     match column_name {
         cf::SlotMeta::NAME => Some(cf::SlotMeta::slot(cf::SlotMeta::index(key))),
         cf::Orphans::NAME => Some(cf::Orphans::slot(cf::Orphans::index(key))),
@@ -674,7 +677,8 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
                     break;
                 }
                 let shreds = source.get_data_shreds_for_slot(slot, 0)?;
-                if target.insert_shreds(shreds, None, true).is_err() {
+                let shreds = shreds.into_iter().map(Cow::Owned);
+                if target.insert_cow_shreds(shreds, None, true).is_err() {
                     warn!("error inserting shreds for slot {}", slot);
                 }
             }

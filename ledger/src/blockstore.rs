@@ -5,10 +5,8 @@
 use {
     crate::{
         ancestor_iterator::AncestorIterator,
-        blockstore_db::{
-            columns as cf, Column, ColumnIndexDeprecation, IteratorDirection, IteratorMode,
-            LedgerColumn, Result, Rocks, WriteBatch,
-        },
+        blockstore::column::{columns as cf, Column, ColumnIndexDeprecation},
+        blockstore_db::{IteratorDirection, IteratorMode, LedgerColumn, Rocks, WriteBatch},
         blockstore_meta::*,
         blockstore_metrics::BlockstoreRpcApiMetrics,
         blockstore_options::{
@@ -86,13 +84,14 @@ use {
     trees::{Tree, TreeWalk},
 };
 pub mod blockstore_purge;
+pub mod column;
+pub mod error;
 #[cfg(test)]
 use static_assertions::const_assert_eq;
 pub use {
     crate::{
-        blockstore_db::{
-            default_num_compaction_threads, default_num_flush_threads, BlockstoreError,
-        },
+        blockstore::error::{BlockstoreError, Result},
+        blockstore_db::{default_num_compaction_threads, default_num_flush_threads},
         blockstore_meta::{OptimisticSlotMetaVersioned, SlotMeta},
         blockstore_metrics::BlockstoreInsertionMetrics,
     },
@@ -139,10 +138,26 @@ enum InsertDataShredError {
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum PossibleDuplicateShred {
     Exists(Shred), // Blockstore has another shred in its spot
-    LastIndexConflict(/* original */ Shred, /* conflict */ Vec<u8>), // The index of this shred conflicts with `slot_meta.last_index`
-    ErasureConflict(/* original */ Shred, /* conflict */ Vec<u8>), // The coding shred has a conflict in the erasure_meta
-    MerkleRootConflict(/* original */ Shred, /* conflict */ Vec<u8>), // Merkle root conflict in the same fec set
-    ChainedMerkleRootConflict(/* original */ Shred, /* conflict */ Vec<u8>), // Merkle root chaining conflict with previous fec set
+    // The index of this shred conflicts with `slot_meta.last_index`
+    LastIndexConflict(
+        Shred,          // original
+        shred::Payload, // conflict
+    ),
+    // The coding shred has a conflict in the erasure_meta
+    ErasureConflict(
+        Shred,          // original
+        shred::Payload, // conflict
+    ),
+    // Merkle root conflict in the same fec set
+    MerkleRootConflict(
+        Shred,          // original
+        shred::Payload, // conflict
+    ),
+    // Merkle root chaining conflict with previous fec set
+    ChainedMerkleRootConflict(
+        Shred,          // original
+        shred::Payload, // conflict
+    ),
 }
 
 impl PossibleDuplicateShred {
@@ -290,9 +305,9 @@ pub struct SlotMetaWorkingSetEntry {
     did_insert_occur: bool,
 }
 
-struct ShredInsertionTracker {
+struct ShredInsertionTracker<'a> {
     // Map which contains data shreds that have just been inserted.
-    just_inserted_shreds: HashMap<ShredId, Shred>,
+    just_inserted_shreds: HashMap<ShredId, Cow<'a, Shred>>,
     // In-memory map that maintains the dirty copy of the erasure meta.  It will
     // later be written to `cf::ErasureMeta`
     erasure_metas: BTreeMap<ErasureSetId, WorkingEntry<ErasureMeta>>,
@@ -315,7 +330,7 @@ struct ShredInsertionTracker {
     newly_completed_data_sets: Vec<CompletedDataSetInfo>,
 }
 
-impl ShredInsertionTracker {
+impl ShredInsertionTracker<'_> {
     fn new(shred_num: usize, write_batch: WriteBatch) -> Self {
         Self {
             just_inserted_shreds: HashMap::with_capacity(shred_num),
@@ -766,13 +781,13 @@ impl Blockstore {
         &'a self,
         index: &'a Index,
         erasure_meta: &'a ErasureMeta,
-        prev_inserted_shreds: &'a HashMap<ShredId, Shred>,
+        prev_inserted_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
     ) -> impl Iterator<Item = Shred> + 'a {
         let slot = index.slot;
         erasure_meta.data_shreds_indices().filter_map(move |i| {
             let key = ShredId::new(slot, u32::try_from(i).unwrap(), ShredType::Data);
             if let Some(shred) = prev_inserted_shreds.get(&key) {
-                return Some(shred.clone());
+                return Some(shred.as_ref().clone());
             }
             if !index.data().contains(i) {
                 return None;
@@ -795,13 +810,13 @@ impl Blockstore {
         &'a self,
         index: &'a Index,
         erasure_meta: &'a ErasureMeta,
-        prev_inserted_shreds: &'a HashMap<ShredId, Shred>,
+        prev_inserted_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
     ) -> impl Iterator<Item = Shred> + 'a {
         let slot = index.slot;
         erasure_meta.coding_shreds_indices().filter_map(move |i| {
             let key = ShredId::new(slot, u32::try_from(i).unwrap(), ShredType::Code);
             if let Some(shred) = prev_inserted_shreds.get(&key) {
-                return Some(shred.clone());
+                return Some(shred.as_ref().clone());
             }
             if !index.coding().contains(i) {
                 return None;
@@ -824,7 +839,7 @@ impl Blockstore {
         &'a self,
         index: &'a Index,
         erasure_meta: &'a ErasureMeta,
-        prev_inserted_shreds: &'a HashMap<ShredId, Shred>,
+        prev_inserted_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
         reed_solomon_cache: &'a ReedSolomonCache,
     ) -> std::result::Result<impl Iterator<Item = Shred> + 'a, shred::Error> {
         // Find shreds for this erasure set and try recovery
@@ -869,14 +884,18 @@ impl Blockstore {
 
     /// Attempts to insert shreds into blockstore and updates relevant metrics
     /// based on the results, split out by shred source (tubine vs. repair).
-    fn attempt_shred_insertion(
+    fn attempt_shred_insertion<'a>(
         &self,
-        shreds: impl ExactSizeIterator<Item = (Shred, /*is_repaired:*/ bool)>,
+        shreds: impl IntoIterator<
+            Item = (Cow<'a, Shred>, /*is_repaired:*/ bool),
+            IntoIter: ExactSizeIterator,
+        >,
         is_trusted: bool,
         leader_schedule: Option<&LeaderScheduleCache>,
-        shred_insertion_tracker: &mut ShredInsertionTracker,
+        shred_insertion_tracker: &mut ShredInsertionTracker<'a>,
         metrics: &mut BlockstoreInsertionMetrics,
     ) {
+        let shreds = shreds.into_iter();
         metrics.num_shreds += shreds.len();
         let mut start = Measure::start("Shred insertion");
         for (shred, is_repaired) in shreds {
@@ -936,7 +955,7 @@ impl Blockstore {
         &'a self,
         erasure_metas: &'a BTreeMap<ErasureSetId, WorkingEntry<ErasureMeta>>,
         index_working_set: &'a HashMap<u64, IndexMetaWorkingSetEntry>,
-        prev_inserted_shreds: &'a HashMap<ShredId, Shred>,
+        prev_inserted_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
         reed_solomon_cache: &'a ReedSolomonCache,
     ) -> impl Iterator<Item = Shred> + 'a {
         // Recovery rules:
@@ -976,7 +995,7 @@ impl Blockstore {
         leader_schedule: Option<&LeaderScheduleCache>,
         reed_solomon_cache: &ReedSolomonCache,
         shred_insertion_tracker: &mut ShredInsertionTracker,
-        retransmit_sender: &Sender<Vec</*shred:*/ Vec<u8>>>,
+        retransmit_sender: &Sender<Vec<shred::Payload>>,
         is_trusted: bool,
         metrics: &mut BlockstoreInsertionMetrics,
     ) {
@@ -995,10 +1014,14 @@ impl Blockstore {
                 // are not stored in blockstore.
                 match shred.shred_type() {
                     ShredType::Code => {
+                        // Don't need Arc overhead here!
+                        debug_assert_matches!(shred.payload(), shred::Payload::Unique(_));
                         recovered_shreds.push(shred.into_payload());
                         None
                     }
                     ShredType::Data => {
+                        // Verify that the cloning is cheap here.
+                        debug_assert_matches!(shred.payload(), shred::Payload::Shared(_));
                         recovered_shreds.push(shred.payload().clone());
                         Some(shred)
                     }
@@ -1011,7 +1034,7 @@ impl Blockstore {
         metrics.num_recovered += recovered_data_shreds.len();
         for shred in recovered_data_shreds {
             *match self.check_insert_data_shred(
-                shred,
+                Cow::Owned(shred),
                 shred_insertion_tracker,
                 is_trusted,
                 leader_schedule,
@@ -1207,9 +1230,12 @@ impl Blockstore {
     /// On success, the function returns an Ok result with a vector of
     /// `CompletedDataSetInfo` and a vector of its corresponding index in the
     /// input `shreds` vector.
-    fn do_insert_shreds(
+    fn do_insert_shreds<'a>(
         &self,
-        shreds: impl ExactSizeIterator<Item = (Shred, /*is_repaired:*/ bool)>,
+        shreds: impl IntoIterator<
+            Item = (Cow<'a, Shred>, /*is_repaired:*/ bool),
+            IntoIter: ExactSizeIterator,
+        >,
         leader_schedule: Option<&LeaderScheduleCache>,
         is_trusted: bool,
         // When inserting own shreds during leader slots, we shouldn't try to
@@ -1219,7 +1245,7 @@ impl Blockstore {
         // recovered shreds.
         should_recover_shreds: Option<(
             &ReedSolomonCache,
-            &Sender<Vec</*shred:*/ Vec<u8>>>, // retransmit_sender
+            &Sender<Vec<shred::Payload>>, // retransmit_sender
         )>,
         metrics: &mut BlockstoreInsertionMetrics,
     ) -> Result<InsertResults> {
@@ -1231,6 +1257,7 @@ impl Blockstore {
         start.stop();
         metrics.insert_lock_elapsed_us += start.as_us();
 
+        let shreds = shreds.into_iter();
         let mut shred_insertion_tracker =
             ShredInsertionTracker::new(shreds.len(), self.get_write_batch()?);
 
@@ -1291,12 +1318,15 @@ impl Blockstore {
     // Attempts to recover and retransmit recovered shreds (also identifying
     // and handling duplicate shreds). Broadcast stage should instead call
     // Blockstore::insert_shreds when inserting own shreds during leader slots.
-    pub fn insert_shreds_handle_duplicate<F>(
+    pub fn insert_shreds_handle_duplicate<'a, F>(
         &self,
-        shreds: impl ExactSizeIterator<Item = (Shred, /*is_repaired:*/ bool)>,
+        shreds: impl IntoIterator<
+            Item = (Cow<'a, Shred>, /*is_repaired:*/ bool),
+            IntoIter: ExactSizeIterator,
+        >,
         leader_schedule: Option<&LeaderScheduleCache>,
         is_trusted: bool,
-        retransmit_sender: &Sender<Vec</*shred:*/ Vec<u8>>>,
+        retransmit_sender: &Sender<Vec<shred::Payload>>,
         handle_duplicate: &F,
         reed_solomon_cache: &ReedSolomonCache,
         metrics: &mut BlockstoreInsertionMetrics,
@@ -1370,9 +1400,9 @@ impl Blockstore {
 
     // Bypasses erasure recovery becuase it is called from broadcast stage
     // when inserting own shreds during leader slots.
-    pub fn insert_shreds(
+    pub fn insert_cow_shreds<'a>(
         &self,
-        shreds: impl IntoIterator<Item = Shred, IntoIter: ExactSizeIterator>,
+        shreds: impl IntoIterator<Item = Cow<'a, Shred>, IntoIter: ExactSizeIterator>,
         leader_schedule: Option<&LeaderScheduleCache>,
         is_trusted: bool,
     ) -> Result<Vec<CompletedDataSetInfo>> {
@@ -1389,6 +1419,17 @@ impl Blockstore {
         Ok(insert_results.completed_data_set_infos)
     }
 
+    // Test-only function.
+    pub fn insert_shreds(
+        &self,
+        shreds: impl IntoIterator<Item = Shred, IntoIter: ExactSizeIterator>,
+        leader_schedule: Option<&LeaderScheduleCache>,
+        is_trusted: bool,
+    ) -> Result<Vec<CompletedDataSetInfo>> {
+        let shreds = shreds.into_iter().map(Cow::Owned);
+        self.insert_cow_shreds(shreds, leader_schedule, is_trusted)
+    }
+
     #[cfg(test)]
     fn insert_shred_return_duplicate(
         &self,
@@ -1397,7 +1438,7 @@ impl Blockstore {
     ) -> Vec<PossibleDuplicateShred> {
         let insert_results = self
             .do_insert_shreds(
-                [(shred, /*is_repaired:*/ false)].into_iter(),
+                [(Cow::Owned(shred), /*is_repaired:*/ false)],
                 Some(leader_schedule),
                 false,
                 None, // (reed_solomon_cache, retransmit_sender)
@@ -1408,10 +1449,10 @@ impl Blockstore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn check_insert_coding_shred(
+    fn check_insert_coding_shred<'a>(
         &self,
-        shred: Shred,
-        shred_insertion_tracker: &mut ShredInsertionTracker,
+        shred: Cow<'a, Shred>,
+        shred_insertion_tracker: &mut ShredInsertionTracker<'a>,
         is_trusted: bool,
         shred_source: ShredSource,
         metrics: &mut BlockstoreInsertionMetrics,
@@ -1447,7 +1488,7 @@ impl Blockstore {
         if !is_trusted {
             if index_meta.coding().contains(shred_index) {
                 metrics.num_coding_shreds_exists += 1;
-                duplicate_shreds.push(PossibleDuplicateShred::Exists(shred));
+                duplicate_shreds.push(PossibleDuplicateShred::Exists(shred.into_owned()));
                 return false;
             }
 
@@ -1501,7 +1542,7 @@ impl Blockstore {
                     }
 
                     duplicate_shreds.push(PossibleDuplicateShred::ErasureConflict(
-                        shred.clone(),
+                        shred.as_ref().clone(),
                         conflicting_shred,
                     ));
                 } else {
@@ -1558,8 +1599,8 @@ impl Blockstore {
         shred: &Shred,
         slot: Slot,
         erasure_meta: &ErasureMeta,
-        just_received_shreds: &'a HashMap<ShredId, Shred>,
-    ) -> Option<Cow<'a, Vec<u8>>> {
+        just_received_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
+    ) -> Option<Cow<'a, shred::Payload>> {
         // Search for the shred which set the initial erasure config, either inserted,
         // or in the current batch in just_received_shreds.
         let index = erasure_meta.first_received_coding_shred_index()?;
@@ -1617,10 +1658,10 @@ impl Blockstore {
     ///     whether it is okay to insert the input shred.
     /// - `shred_source`: the source of the shred.
     #[allow(clippy::too_many_arguments)]
-    fn check_insert_data_shred(
+    fn check_insert_data_shred<'a>(
         &self,
-        shred: Shred,
-        shred_insertion_tracker: &mut ShredInsertionTracker,
+        shred: Cow<'a, Shred>,
+        shred_insertion_tracker: &mut ShredInsertionTracker<'a>,
         is_trusted: bool,
         leader_schedule: Option<&LeaderScheduleCache>,
         shred_source: ShredSource,
@@ -1661,7 +1702,7 @@ impl Blockstore {
 
         if !is_trusted {
             if Self::is_data_shred_present(&shred, slot_meta, index_meta.data()) {
-                duplicate_shreds.push(PossibleDuplicateShred::Exists(shred));
+                duplicate_shreds.push(PossibleDuplicateShred::Exists(shred.into_owned()));
                 return Err(InsertDataShredError::Exists);
             }
 
@@ -1782,9 +1823,9 @@ impl Blockstore {
     /// shreds or the backing store. Returns None if there is no shred.
     fn get_shred_from_just_inserted_or_db<'a>(
         &'a self,
-        just_inserted_shreds: &'a HashMap<ShredId, Shred>,
+        just_inserted_shreds: &'a HashMap<ShredId, Cow<'_, Shred>>,
         shred_id: ShredId,
-    ) -> Option<Cow<'a, Vec<u8>>> {
+    ) -> Option<Cow<'a, shred::Payload>> {
         let (slot, index, shred_type) = shred_id.unpack();
         match (just_inserted_shreds.get(&shred_id), shred_type) {
             (Some(shred), _) => Some(Cow::Borrowed(shred.payload())),
@@ -1793,10 +1834,12 @@ impl Blockstore {
             (_, ShredType::Data) => self
                 .get_data_shred(slot, u64::from(index))
                 .unwrap()
+                .map(shred::Payload::from)
                 .map(Cow::Owned),
             (_, ShredType::Code) => self
                 .get_coding_shred(slot, u64::from(index))
                 .unwrap()
+                .map(shred::Payload::from)
                 .map(Cow::Owned),
         }
     }
@@ -1808,7 +1851,7 @@ impl Blockstore {
     /// `duplicate_shreds`.
     fn check_merkle_root_consistency(
         &self,
-        just_inserted_shreds: &HashMap<ShredId, Shred>,
+        just_inserted_shreds: &HashMap<ShredId, Cow<'_, Shred>>,
         slot: Slot,
         merkle_root_meta: &MerkleRootMeta,
         shred: &Shred,
@@ -1883,7 +1926,7 @@ impl Blockstore {
         &self,
         shred: &Shred,
         erasure_meta: &ErasureMeta,
-        just_inserted_shreds: &HashMap<ShredId, Shred>,
+        just_inserted_shreds: &HashMap<ShredId, Cow<'_, Shred>>,
         merkle_root_metas: &HashMap<ErasureSetId, WorkingEntry<MerkleRootMeta>>,
         duplicate_shreds: &mut Vec<PossibleDuplicateShred>,
     ) -> bool {
@@ -1964,7 +2007,7 @@ impl Blockstore {
     fn check_backwards_chained_merkle_root_consistency(
         &self,
         shred: &Shred,
-        just_inserted_shreds: &HashMap<ShredId, Shred>,
+        just_inserted_shreds: &HashMap<ShredId, Cow<'_, Shred>>,
         erasure_metas: &BTreeMap<ErasureSetId, WorkingEntry<ErasureMeta>>,
         duplicate_shreds: &mut Vec<PossibleDuplicateShred>,
     ) -> bool {
@@ -2048,7 +2091,7 @@ impl Blockstore {
         &self,
         shred: &Shred,
         slot_meta: &SlotMeta,
-        just_inserted_shreds: &HashMap<ShredId, Shred>,
+        just_inserted_shreds: &HashMap<ShredId, Cow<'_, Shred>>,
         max_root: Slot,
         leader_schedule: Option<&LeaderScheduleCache>,
         shred_source: ShredSource,
@@ -2578,7 +2621,7 @@ impl Blockstore {
         Err(BlockstoreError::SlotNotRooted)
     }
 
-    pub fn cache_block_time(&self, slot: Slot, timestamp: UnixTimestamp) -> Result<()> {
+    pub fn set_block_time(&self, slot: Slot, timestamp: UnixTimestamp) -> Result<()> {
         self.blocktime_cf.put(slot, &timestamp)
     }
 
@@ -2591,7 +2634,7 @@ impl Blockstore {
         self.block_height_cf.get(slot)
     }
 
-    pub fn cache_block_height(&self, slot: Slot, block_height: u64) -> Result<()> {
+    pub fn set_block_height(&self, slot: Slot, block_height: u64) -> Result<()> {
         self.block_height_cf.put(slot, &block_height)
     }
 
@@ -3790,9 +3833,8 @@ impl Blockstore {
         let results = self.check_last_fec_set(slot);
         let Ok(results) = results else {
             warn!(
-                "Unable to check the last fec set for slot {} {},
+                "Unable to check the last fec set for slot {slot} {bank_hash}, \
                  marking as dead: {results:?}",
-                slot, bank_hash,
             );
             if feature_set.is_active(&solana_sdk::feature_set::vote_only_full_fec_sets::id()) {
                 return Err(BlockstoreProcessorError::IncompleteFinalFecSet);
@@ -4057,7 +4099,10 @@ impl Blockstore {
             .map(|(slot, proof_bytes)| (slot, deserialize(&proof_bytes).unwrap()))
     }
 
-    pub fn store_duplicate_slot(&self, slot: Slot, shred1: Vec<u8>, shred2: Vec<u8>) -> Result<()> {
+    pub fn store_duplicate_slot<S, T>(&self, slot: Slot, shred1: S, shred2: T) -> Result<()>
+    where
+        shred::Payload: From<S> + From<T>,
+    {
         let duplicate_slot_proof = DuplicateSlotProof::new(shred1, shred2);
         self.duplicate_slots_cf.put(slot, &duplicate_slot_proof)
     }
@@ -4086,7 +4131,7 @@ impl Blockstore {
                 error!("set retransmitter signature failed: {err:?}");
             }
         }
-        (&other != shred.payload()).then_some(other)
+        (other != **shred.payload()).then_some(other)
     }
 
     pub fn has_duplicate_shreds_in_slot(&self, slot: Slot) -> bool {
@@ -5357,7 +5402,7 @@ pub mod tests {
         super::*,
         crate::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
-            leader_schedule::{FixedSchedule, LeaderSchedule},
+            leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule},
             shred::{max_ticks_per_n_shreds, ShredFlags, LEGACY_SHRED_DATA_CAPACITY},
         },
         assert_matches::assert_matches,
@@ -7499,7 +7544,7 @@ pub mod tests {
         let mut shred_insertion_tracker =
             ShredInsertionTracker::new(coding_shreds.len(), blockstore.get_write_batch().unwrap());
         assert!(blockstore.check_insert_coding_shred(
-            coding_shred.clone(),
+            Cow::Borrowed(&coding_shred),
             &mut shred_insertion_tracker,
             false,
             ShredSource::Turbine,
@@ -7553,7 +7598,7 @@ pub mod tests {
             ShredInsertionTracker::new(coding_shreds.len(), blockstore.get_write_batch().unwrap());
 
         assert!(!blockstore.check_insert_coding_shred(
-            new_coding_shred.clone(),
+            Cow::Owned(new_coding_shred),
             &mut shred_insertion_tracker,
             false,
             ShredSource::Turbine,
@@ -7616,7 +7661,7 @@ pub mod tests {
         let new_coding_shred = coding_shreds[0].clone();
 
         assert!(blockstore.check_insert_coding_shred(
-            new_coding_shred.clone(),
+            Cow::Borrowed(&new_coding_shred),
             &mut shred_insertion_tracker,
             false,
             ShredSource::Turbine,
@@ -7681,7 +7726,7 @@ pub mod tests {
             ShredInsertionTracker::new(data_shreds.len(), blockstore.get_write_batch().unwrap());
         blockstore
             .check_insert_data_shred(
-                data_shred.clone(),
+                Cow::Borrowed(&data_shred),
                 &mut shred_insertion_tracker,
                 false,
                 None,
@@ -7737,7 +7782,7 @@ pub mod tests {
 
         assert!(blockstore
             .check_insert_data_shred(
-                new_data_shred.clone(),
+                Cow::Owned(new_data_shred),
                 &mut shred_insertion_tracker,
                 false,
                 None,
@@ -7817,7 +7862,7 @@ pub mod tests {
             ShredInsertionTracker::new(data_shreds.len(), blockstore.db.batch().unwrap());
         blockstore
             .check_insert_data_shred(
-                new_data_shred.clone(),
+                Cow::Borrowed(&new_data_shred),
                 &mut shred_insertion_tracker,
                 false,
                 None,
@@ -7889,7 +7934,7 @@ pub mod tests {
         let mut shred_insertion_tracker =
             ShredInsertionTracker::new(1, blockstore.get_write_batch().unwrap());
         assert!(blockstore.check_insert_coding_shred(
-            coding_shred.clone(),
+            Cow::Borrowed(&coding_shred),
             &mut shred_insertion_tracker,
             false,
             ShredSource::Turbine,
@@ -7898,7 +7943,7 @@ pub mod tests {
 
         // insert again fails on dupe
         assert!(!blockstore.check_insert_coding_shred(
-            coding_shred.clone(),
+            Cow::Borrowed(&coding_shred),
             &mut shred_insertion_tracker,
             false,
             ShredSource::Turbine,
@@ -10231,11 +10276,12 @@ pub mod tests {
             setup_erasure_shreds(slot, 0, 100);
 
         let (dummy_retransmit_sender, _) = crossbeam_channel::bounded(0);
+        let coding_shreds = coding_shreds
+            .into_iter()
+            .map(|shred| (Cow::Owned(shred), /*is_repaired:*/ false));
         blockstore
             .do_insert_shreds(
-                coding_shreds
-                    .into_iter()
-                    .map(|shred| (shred, /*is_repaired:*/ false)),
+                coding_shreds,
                 Some(&leader_schedule_cache),
                 false, // is_trusted
                 Some((&ReedSolomonCache::default(), &dummy_retransmit_sender)),
@@ -10251,7 +10297,7 @@ pub mod tests {
                     .get_data_shred(s.slot(), s.index() as u64)
                     .unwrap()
                     .unwrap(),
-                buf
+                buf.as_ref(),
             );
         }
 
@@ -10462,9 +10508,9 @@ pub mod tests {
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let fixed_schedule = FixedSchedule {
-            leader_schedule: Arc::new(LeaderSchedule::new_from_schedule(vec![
-                leader_keypair.pubkey()
-            ])),
+            leader_schedule: Arc::new(Box::new(IdentityKeyedLeaderSchedule::new_from_schedule(
+                vec![leader_keypair.pubkey()],
+            ))),
         };
         leader_schedule_cache.set_fixed_leader_schedule(Some(fixed_schedule));
 
@@ -10551,8 +10597,8 @@ pub mod tests {
 
         // Check if shreds are duplicated
         assert_eq!(
-            blockstore.is_shred_duplicate(&duplicate_shred),
-            Some(shred.payload().clone())
+            blockstore.is_shred_duplicate(&duplicate_shred).as_deref(),
+            Some(shred.payload().as_ref())
         );
         assert!(blockstore
             .is_shred_duplicate(&non_duplicate_shred)
@@ -11036,7 +11082,7 @@ pub mod tests {
             if i <= smaller_last_shred_index as u64 {
                 assert_eq!(
                     blockstore.get_data_shred(slot, i).unwrap().unwrap(),
-                    *shreds[i as usize].payload()
+                    shreds[i as usize].payload().as_ref(),
                 );
             } else {
                 assert!(blockstore.get_data_shred(slot, i).unwrap().is_none());
@@ -11068,7 +11114,7 @@ pub mod tests {
             if i <= smaller_last_shred_index as u64 {
                 assert_eq!(
                     blockstore.get_data_shred(slot, i).unwrap().unwrap(),
-                    *shreds[i as usize].payload()
+                    shreds[i as usize].payload().as_ref(),
                 );
             } else {
                 assert!(blockstore.get_data_shred(slot, i).unwrap().is_none());
@@ -11104,7 +11150,7 @@ pub mod tests {
                         .get_data_shred(slot, shred_index)
                         .unwrap()
                         .unwrap(),
-                    *shred_to_check.payload()
+                    shred_to_check.payload().as_ref(),
                 );
             } else {
                 assert!(blockstore
@@ -11135,7 +11181,7 @@ pub mod tests {
                         .get_data_shred(slot, shred_index)
                         .unwrap()
                         .unwrap(),
-                    *shred_to_check.payload()
+                    shred_to_check.payload().as_ref(),
                 );
             } else {
                 assert!(blockstore

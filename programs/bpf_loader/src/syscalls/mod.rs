@@ -13,6 +13,8 @@ pub use self::{
 #[allow(deprecated)]
 use {
     solana_account_info::AccountInfo,
+    solana_big_mod_exp::{big_mod_exp, BigModExpParams},
+    solana_blake3_hasher as blake3,
     solana_bn254::prelude::{
         alt_bn128_addition, alt_bn128_multiplication, alt_bn128_multiplication_128,
         alt_bn128_pairing, AltBn128Error, ALT_BN128_ADDITION_OUTPUT_LEN,
@@ -38,10 +40,6 @@ use {
     solana_log_collector::{ic_logger_msg, ic_msg},
     solana_poseidon as poseidon,
     solana_precompiles::is_precompile,
-    solana_program::{
-        big_mod_exp::{big_mod_exp, BigModExpParams},
-        blake3,
-    },
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_memory::is_nonoverlapping,
     solana_program_runtime::{invoke_context::InvokeContext, stable_log},
@@ -49,7 +47,7 @@ use {
     solana_sbpf::{
         declare_builtin_function,
         memory_region::{AccessType, MemoryMapping},
-        program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+        program::{BuiltinProgram, SBPFVersion},
         vm::Config,
     },
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, native_loader},
@@ -64,6 +62,7 @@ use {
     solana_type_overrides::sync::Arc,
     std::{
         alloc::Layout,
+        marker::PhantomData,
         mem::{align_of, size_of},
         slice::from_raw_parts_mut,
         str::{from_utf8, Utf8Error},
@@ -231,15 +230,77 @@ impl HasherImpl for Keccak256Hasher {
     }
 }
 
+// The VmSlice class is used for cases when you need a slice that is stored in the BPF
+// interpreter's virtual address space. Because this source code can be compiled with
+// addresses of different bit depths, we cannot assume that the 64-bit BPF interpreter's
+// pointer sizes can be mapped to physical pointer sizes. In particular, if you need a
+// slice-of-slices in the virtual space, the inner slices will be different sizes in a
+// 32-bit app build than in the 64-bit virtual space. Therefore instead of a slice-of-slices,
+// you should implement a slice-of-VmSlices, which can then use VmSlice::translate() to
+// map to the physical address.
+// This class must consist only of 16 bytes: a u64 ptr and a u64 len, to match the 64-bit
+// implementation of a slice in Rust. The PhantomData entry takes up 0 bytes.
+
+#[repr(C)]
+pub struct VmSlice<T> {
+    ptr: u64,
+    len: u64,
+    resource_type: PhantomData<T>,
+}
+
+impl<T> VmSlice<T> {
+    pub fn new(ptr: u64, len: u64) -> Self {
+        VmSlice {
+            ptr,
+            len,
+            resource_type: PhantomData,
+        }
+    }
+
+    pub fn ptr(&self) -> u64 {
+        self.ptr
+    }
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Adjust the length of the vector. This is unchecked, and it assumes that the pointer
+    /// points to valid memory of the correct length after vm-translation.
+    pub fn resize(&mut self, len: u64) {
+        self.len = len;
+    }
+
+    /// Returns a slice using a mapped physical address
+    pub fn translate(
+        &self,
+        memory_mapping: &MemoryMapping,
+        check_aligned: bool,
+    ) -> Result<&[T], Error> {
+        translate_slice::<T>(memory_mapping, self.ptr, self.len, check_aligned)
+    }
+
+    pub fn translate_mut(
+        &mut self,
+        memory_mapping: &MemoryMapping,
+        check_aligned: bool,
+    ) -> Result<&mut [T], Error> {
+        translate_slice_mut::<T>(memory_mapping, self.ptr, self.len, check_aligned)
+    }
+}
+
 fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<(), Error> {
     invoke_context.consume_checked(amount)?;
     Ok(())
 }
 
 macro_rules! register_feature_gated_function {
-    ($result:expr, $is_feature_active:expr, $name:expr, $key:expr, $call:expr $(,)?) => {
+    ($result:expr, $is_feature_active:expr, $name:expr, $call:expr $(,)?) => {
         if $is_feature_active {
-            $result.register_function($name, $key, $call)
+            $result.register_function($name, $call)
         } else {
             Ok(())
         }
@@ -256,12 +317,12 @@ pub(crate) fn morph_into_deployment_environment_v1(
     // config.enabled_sbpf_versions =
     //     *config.enabled_sbpf_versions.end()..=*config.enabled_sbpf_versions.end();
 
-    let mut result = BuiltinProgram::new_loader_with_dense_registration(config);
+    let mut result = BuiltinProgram::new_loader(config);
 
-    for (key, (name, value)) in from.get_function_registry(SBPFVersion::V3).iter() {
+    for (_key, (name, value)) in from.get_function_registry().iter() {
         // Deployment of programs with sol_alloc_free is disabled. So do not register the syscall.
         if name != *b"sol_alloc_free_" {
-            result.register_function(unsafe { std::str::from_utf8_unchecked(name) }, key, value)?;
+            result.register_function(unsafe { std::str::from_utf8_unchecked(name) }, value)?;
         }
     }
 
@@ -326,47 +387,44 @@ pub fn create_program_runtime_environment_v1<'a>(
         aligned_memory_mapping: !feature_set.is_active(&bpf_account_data_direct_mapping::id()),
         // Warning, do not use `Config::default()` so that configuration here is explicit.
     };
-    let mut result = BuiltinProgram::new_loader_with_dense_registration(config);
+    let mut result = BuiltinProgram::new_loader(config);
 
     // Abort
-    result.register_function("abort", 1, SyscallAbort::vm)?;
+    result.register_function("abort", SyscallAbort::vm)?;
 
     // Panic
-    result.register_function("sol_panic_", 2, SyscallPanic::vm)?;
+    result.register_function("sol_panic_", SyscallPanic::vm)?;
 
     // Logging
-    result.register_function("sol_log_", 7, SyscallLog::vm)?;
-    result.register_function("sol_log_64_", 8, SyscallLogU64::vm)?;
-    result.register_function("sol_log_pubkey", 9, SyscallLogPubkey::vm)?;
-    result.register_function("sol_log_compute_units_", 10, SyscallLogBpfComputeUnits::vm)?;
+    result.register_function("sol_log_", SyscallLog::vm)?;
+    result.register_function("sol_log_64_", SyscallLogU64::vm)?;
+    result.register_function("sol_log_pubkey", SyscallLogPubkey::vm)?;
+    result.register_function("sol_log_compute_units_", SyscallLogBpfComputeUnits::vm)?;
 
     // Program defined addresses (PDA)
     result.register_function(
         "sol_create_program_address",
-        32,
         SyscallCreateProgramAddress::vm,
     )?;
     result.register_function(
         "sol_try_find_program_address",
-        33,
         SyscallTryFindProgramAddress::vm,
     )?;
 
     // Sha256
-    result.register_function("sol_sha256", 17, SyscallHash::vm::<Sha256Hasher>)?;
+    result.register_function("sol_sha256", SyscallHash::vm::<Sha256Hasher>)?;
 
     // Keccak256
-    result.register_function("sol_keccak256", 18, SyscallHash::vm::<Keccak256Hasher>)?;
+    result.register_function("sol_keccak256", SyscallHash::vm::<Keccak256Hasher>)?;
 
     // Secp256k1 Recover
-    result.register_function("sol_secp256k1_recover", 19, SyscallSecp256k1Recover::vm)?;
+    result.register_function("sol_secp256k1_recover", SyscallSecp256k1Recover::vm)?;
 
     // Blake3
     register_feature_gated_function!(
         result,
         blake3_syscall_enabled,
         "sol_blake3",
-        20,
         SyscallHash::vm::<Blake3Hasher>,
     )?;
 
@@ -375,84 +433,75 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         curve25519_syscall_enabled,
         "sol_curve_validate_point",
-        24,
         SyscallCurvePointValidation::vm,
     )?;
     register_feature_gated_function!(
         result,
         curve25519_syscall_enabled,
         "sol_curve_group_op",
-        25,
         SyscallCurveGroupOps::vm,
     )?;
     register_feature_gated_function!(
         result,
         curve25519_syscall_enabled,
         "sol_curve_multiscalar_mul",
-        26,
         SyscallCurveMultiscalarMultiplication::vm,
     )?;
 
     // Sysvars
-    result.register_function("sol_get_clock_sysvar", 36, SyscallGetClockSysvar::vm)?;
+    result.register_function("sol_get_clock_sysvar", SyscallGetClockSysvar::vm)?;
     result.register_function(
         "sol_get_epoch_schedule_sysvar",
-        37,
         SyscallGetEpochScheduleSysvar::vm,
     )?;
     register_feature_gated_function!(
         result,
         !disable_fees_sysvar,
         "sol_get_fees_sysvar",
-        40,
         SyscallGetFeesSysvar::vm,
     )?;
-    result.register_function("sol_get_rent_sysvar", 41, SyscallGetRentSysvar::vm)?;
+    result.register_function("sol_get_rent_sysvar", SyscallGetRentSysvar::vm)?;
 
     register_feature_gated_function!(
         result,
         last_restart_slot_syscall_enabled,
         "sol_get_last_restart_slot",
-        38,
         SyscallGetLastRestartSlotSysvar::vm,
     )?;
 
     result.register_function(
         "sol_get_epoch_rewards_sysvar",
-        39,
         SyscallGetEpochRewardsSysvar::vm,
     )?;
 
     // Memory ops
-    result.register_function("sol_memcpy_", 3, SyscallMemcpy::vm)?;
-    result.register_function("sol_memmove_", 4, SyscallMemmove::vm)?;
-    result.register_function("sol_memset_", 5, SyscallMemset::vm)?;
-    result.register_function("sol_memcmp_", 6, SyscallMemcmp::vm)?;
+    result.register_function("sol_memcpy_", SyscallMemcpy::vm)?;
+    result.register_function("sol_memmove_", SyscallMemmove::vm)?;
+    result.register_function("sol_memset_", SyscallMemset::vm)?;
+    result.register_function("sol_memcmp_", SyscallMemcmp::vm)?;
 
     // Processed sibling instructions
     result.register_function(
         "sol_get_processed_sibling_instruction",
-        22,
         SyscallGetProcessedSiblingInstruction::vm,
     )?;
 
     // Stack height
-    result.register_function("sol_get_stack_height", 23, SyscallGetStackHeight::vm)?;
+    result.register_function("sol_get_stack_height", SyscallGetStackHeight::vm)?;
 
     // Return data
-    result.register_function("sol_set_return_data", 14, SyscallSetReturnData::vm)?;
-    result.register_function("sol_get_return_data", 15, SyscallGetReturnData::vm)?;
+    result.register_function("sol_set_return_data", SyscallSetReturnData::vm)?;
+    result.register_function("sol_get_return_data", SyscallGetReturnData::vm)?;
 
     // Cross-program invocation
-    result.register_function("sol_invoke_signed_c", 12, SyscallInvokeSignedC::vm)?;
-    result.register_function("sol_invoke_signed_rust", 13, SyscallInvokeSignedRust::vm)?;
+    result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
+    result.register_function("sol_invoke_signed_rust", SyscallInvokeSignedRust::vm)?;
 
     // Memory allocator
     register_feature_gated_function!(
         result,
         !disable_deploy_of_alloc_free_syscall,
         "sol_alloc_free_",
-        11,
         SyscallAllocFree::vm,
     )?;
 
@@ -461,7 +510,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         enable_alt_bn128_syscall,
         "sol_alt_bn128_group_op",
-        28,
         SyscallAltBn128::vm,
     )?;
 
@@ -470,7 +518,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         enable_big_mod_exp_syscall,
         "sol_big_mod_exp",
-        30,
         SyscallBigModExp::vm,
     )?;
 
@@ -479,7 +526,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         enable_poseidon_syscall,
         "sol_poseidon",
-        21,
         SyscallPoseidon::vm,
     )?;
 
@@ -488,7 +534,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         remaining_compute_units_syscall_enabled,
         "sol_remaining_compute_units",
-        31,
         SyscallRemainingComputeUnits::vm
     )?;
 
@@ -497,7 +542,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         enable_alt_bn128_compression_syscall,
         "sol_alt_bn128_compression",
-        29,
         SyscallAltBn128Compression::vm,
     )?;
 
@@ -506,7 +550,6 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         get_sysvar_syscall_enabled,
         "sol_get_sysvar",
-        34,
         SyscallGetSysvar::vm,
     )?;
 
@@ -515,12 +558,11 @@ pub fn create_program_runtime_environment_v1<'a>(
         result,
         enable_get_epoch_stake_syscall,
         "sol_get_epoch_stake",
-        35,
         SyscallGetEpochStake::vm,
     )?;
 
     // Log data
-    result.register_function("sol_log_data", 16, SyscallLogData::vm)?;
+    result.register_function("sol_log_data", SyscallLogData::vm)?;
 
     Ok(result)
 }
@@ -546,7 +588,7 @@ pub fn create_program_runtime_environment_v2<'a>(
         aligned_memory_mapping: true,
         // Warning, do not use `Config::default()` so that configuration here is explicit.
     };
-    BuiltinProgram::new_loader(config, FunctionRegistry::default())
+    BuiltinProgram::new_loader(config)
 }
 
 fn address_is_aligned<T>(address: u64) -> bool {
@@ -643,6 +685,62 @@ fn translate_slice<'a, T>(
     check_aligned: bool,
 ) -> Result<&'a [T], Error> {
     translate_slice_inner::<T>(
+        memory_mapping,
+        AccessType::Load,
+        vm_addr,
+        len,
+        check_aligned,
+    )
+    .map(|value| &*value)
+}
+
+fn translate_slice_of_slices_inner<'a, T>(
+    memory_mapping: &MemoryMapping,
+    access_type: AccessType,
+    vm_addr: u64,
+    len: u64,
+    check_aligned: bool,
+) -> Result<&'a mut [VmSlice<T>], Error> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+
+    let total_size = len.saturating_mul(size_of::<VmSlice<T>>() as u64);
+    if isize::try_from(total_size).is_err() {
+        return Err(SyscallError::InvalidLength.into());
+    }
+
+    let host_addr = translate(memory_mapping, access_type, vm_addr, total_size)?;
+
+    if check_aligned && !address_is_aligned::<VmSlice<T>>(host_addr) {
+        return Err(SyscallError::UnalignedPointer.into());
+    }
+    Ok(unsafe { from_raw_parts_mut(host_addr as *mut VmSlice<T>, len as usize) })
+}
+
+#[allow(dead_code)]
+fn translate_slice_of_slices_mut<'a, T>(
+    memory_mapping: &MemoryMapping,
+    vm_addr: u64,
+    len: u64,
+    check_aligned: bool,
+) -> Result<&'a mut [VmSlice<T>], Error> {
+    translate_slice_of_slices_inner::<T>(
+        memory_mapping,
+        AccessType::Store,
+        vm_addr,
+        len,
+        check_aligned,
+    )
+}
+
+fn translate_slice_of_slices<'a, T>(
+    memory_mapping: &MemoryMapping,
+    vm_addr: u64,
+    len: u64,
+    check_aligned: bool,
+) -> Result<&'a [VmSlice<T>], Error> {
+    translate_slice_of_slices_inner::<T>(
         memory_mapping,
         AccessType::Load,
         vm_addr,
@@ -758,22 +856,17 @@ fn translate_and_check_program_address_inputs<'a>(
     check_aligned: bool,
 ) -> Result<(Vec<&'a [u8]>, &'a Pubkey), Error> {
     let untranslated_seeds =
-        translate_slice::<&[u8]>(memory_mapping, seeds_addr, seeds_len, check_aligned)?;
+        translate_slice_of_slices::<u8>(memory_mapping, seeds_addr, seeds_len, check_aligned)?;
     if untranslated_seeds.len() > MAX_SEEDS {
         return Err(SyscallError::BadSeeds(PubkeyError::MaxSeedLengthExceeded).into());
     }
     let seeds = untranslated_seeds
         .iter()
         .map(|untranslated_seed| {
-            if untranslated_seed.len() > MAX_SEED_LEN {
+            if untranslated_seed.len() > MAX_SEED_LEN as u64 {
                 return Err(SyscallError::BadSeeds(PubkeyError::MaxSeedLengthExceeded).into());
             }
-            translate_slice::<u8>(
-                memory_mapping,
-                untranslated_seed.as_ptr() as *const _ as u64,
-                untranslated_seed.len() as u64,
-                check_aligned,
-            )
+            untranslated_seed.translate(memory_mapping, check_aligned)
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let program_id = translate_type::<Pubkey>(memory_mapping, program_id_addr, check_aligned)?;
@@ -1838,7 +1931,7 @@ declare_builtin_function!(
             poseidon::HASH_BYTES as u64,
             invoke_context.get_check_aligned(),
         )?;
-        let inputs = translate_slice::<&[u8]>(
+        let inputs = translate_slice_of_slices::<u8>(
             memory_mapping,
             vals_addr,
             vals_len,
@@ -1846,14 +1939,7 @@ declare_builtin_function!(
         )?;
         let inputs = inputs
             .iter()
-            .map(|input| {
-                translate_slice::<u8>(
-                    memory_mapping,
-                    input.as_ptr() as *const _ as u64,
-                    input.len() as u64,
-                    invoke_context.get_check_aligned(),
-                )
-            })
+            .map(|input| input.translate(memory_mapping, invoke_context.get_check_aligned()))
             .collect::<Result<Vec<_>, Error>>()?;
 
         let simplify_alt_bn128_syscall_error_codes = invoke_context
@@ -2054,22 +2140,18 @@ declare_builtin_function!(
         )?;
         let mut hasher = H::create_hasher();
         if vals_len > 0 {
-            let vals = translate_slice::<&[u8]>(
+            let vals = translate_slice_of_slices::<u8>(
                 memory_mapping,
                 vals_addr,
                 vals_len,
                 invoke_context.get_check_aligned(),
             )?;
+
             for val in vals.iter() {
-                let bytes = translate_slice::<u8>(
-                    memory_mapping,
-                    val.as_ptr() as u64,
-                    val.len() as u64,
-                    invoke_context.get_check_aligned(),
-                )?;
+                let bytes = val.translate(memory_mapping, invoke_context.get_check_aligned())?;
                 let cost = compute_budget.mem_op_base_cost.max(
                     hash_byte_cost.saturating_mul(
-                        (val.len() as u64)
+                        val.len()
                             .checked_div(2)
                             .expect("div by non-zero literal"),
                     ),
@@ -3595,12 +3677,13 @@ mod tests {
             let mut got_clock_buf = vec![0; Clock::size_of()];
             let got_clock_buf_va = 0x200000000;
             let clock_id_va = 0x300000000;
+            let clock_id = Clock::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
                     MemoryRegion::new_writable(bytes_of_mut(&mut got_clock_obj), got_clock_obj_va),
                     MemoryRegion::new_writable(&mut got_clock_buf, got_clock_buf_va),
-                    MemoryRegion::new_readonly(&Clock::id().to_bytes(), clock_id_va),
+                    MemoryRegion::new_readonly(&clock_id, clock_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3616,7 +3699,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_clock_obj, src_clock);
 
             let mut clean_clock = create_filled_type::<Clock>(true);
@@ -3636,7 +3719,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let clock_from_buf = bincode::deserialize::<Clock>(&got_clock_buf).unwrap();
 
@@ -3652,6 +3735,7 @@ mod tests {
             let mut got_epochschedule_buf = vec![0; EpochSchedule::size_of()];
             let got_epochschedule_buf_va = 0x200000000;
             let epochschedule_id_va = 0x300000000;
+            let epochschedule_id = EpochSchedule::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
@@ -3663,10 +3747,7 @@ mod tests {
                         &mut got_epochschedule_buf,
                         got_epochschedule_buf_va,
                     ),
-                    MemoryRegion::new_readonly(
-                        &EpochSchedule::id().to_bytes(),
-                        epochschedule_id_va,
-                    ),
+                    MemoryRegion::new_readonly(&epochschedule_id, epochschedule_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3682,7 +3763,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_epochschedule_obj, src_epochschedule);
 
             let mut clean_epochschedule = create_filled_type::<EpochSchedule>(true);
@@ -3706,7 +3787,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let epochschedule_from_buf =
                 bincode::deserialize::<EpochSchedule>(&got_epochschedule_buf).unwrap();
@@ -3744,7 +3825,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_fees, src_fees);
 
             let mut clean_fees = create_filled_type::<Fees>(true);
@@ -3762,12 +3843,13 @@ mod tests {
             let mut got_rent_buf = vec![0; Rent::size_of()];
             let got_rent_buf_va = 0x200000000;
             let rent_id_va = 0x300000000;
+            let rent_id = Rent::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
                     MemoryRegion::new_writable(bytes_of_mut(&mut got_rent_obj), got_rent_obj_va),
                     MemoryRegion::new_writable(&mut got_rent_buf, got_rent_buf_va),
-                    MemoryRegion::new_readonly(&Rent::id().to_bytes(), rent_id_va),
+                    MemoryRegion::new_readonly(&rent_id, rent_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3783,7 +3865,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_rent_obj, src_rent);
 
             let mut clean_rent = create_filled_type::<Rent>(true);
@@ -3801,7 +3883,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let rent_from_buf = bincode::deserialize::<Rent>(&got_rent_buf).unwrap();
 
@@ -3819,6 +3901,7 @@ mod tests {
             let mut got_rewards_buf = vec![0; EpochRewards::size_of()];
             let got_rewards_buf_va = 0x200000000;
             let rewards_id_va = 0x300000000;
+            let rewards_id = EpochRewards::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
@@ -3827,7 +3910,7 @@ mod tests {
                         got_rewards_obj_va,
                     ),
                     MemoryRegion::new_writable(&mut got_rewards_buf, got_rewards_buf_va),
-                    MemoryRegion::new_readonly(&EpochRewards::id().to_bytes(), rewards_id_va),
+                    MemoryRegion::new_readonly(&rewards_id, rewards_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3843,7 +3926,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_rewards_obj, src_rewards);
 
             let mut clean_rewards = create_filled_type::<EpochRewards>(true);
@@ -3866,7 +3949,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let rewards_from_buf = bincode::deserialize::<EpochRewards>(&got_rewards_buf).unwrap();
 
@@ -3884,6 +3967,7 @@ mod tests {
             let mut got_restart_buf = vec![0; LastRestartSlot::size_of()];
             let got_restart_buf_va = 0x200000000;
             let restart_id_va = 0x300000000;
+            let restart_id = LastRestartSlot::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
@@ -3892,7 +3976,7 @@ mod tests {
                         got_restart_obj_va,
                     ),
                     MemoryRegion::new_writable(&mut got_restart_buf, got_restart_buf_va),
-                    MemoryRegion::new_readonly(&LastRestartSlot::id().to_bytes(), restart_id_va),
+                    MemoryRegion::new_readonly(&restart_id, restart_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3908,7 +3992,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
             assert_eq!(got_restart_obj, src_restart);
 
             let mut clean_restart = create_filled_type::<LastRestartSlot>(true);
@@ -3924,7 +4008,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let restart_from_buf =
                 bincode::deserialize::<LastRestartSlot>(&got_restart_buf).unwrap();
@@ -3973,11 +4057,12 @@ mod tests {
             let mut got_history_buf = vec![0; StakeHistory::size_of()];
             let got_history_buf_va = 0x100000000;
             let history_id_va = 0x200000000;
+            let history_id = StakeHistory::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
                     MemoryRegion::new_writable(&mut got_history_buf, got_history_buf_va),
-                    MemoryRegion::new_readonly(&StakeHistory::id().to_bytes(), history_id_va),
+                    MemoryRegion::new_readonly(&history_id, history_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -3993,7 +4078,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let history_from_buf = bincode::deserialize::<StakeHistory>(&got_history_buf).unwrap();
             assert_eq!(history_from_buf, src_history);
@@ -4032,11 +4117,12 @@ mod tests {
             let mut got_hashes_buf = vec![0; SlotHashes::size_of()];
             let got_hashes_buf_va = 0x100000000;
             let hashes_id_va = 0x200000000;
+            let hashes_id = SlotHashes::id().to_bytes();
 
             let mut memory_mapping = MemoryMapping::new(
                 vec![
                     MemoryRegion::new_writable(&mut got_hashes_buf, got_hashes_buf_va),
-                    MemoryRegion::new_readonly(&SlotHashes::id().to_bytes(), hashes_id_va),
+                    MemoryRegion::new_readonly(&hashes_id, hashes_id_va),
                 ],
                 &config,
                 SBPFVersion::V3,
@@ -4052,7 +4138,7 @@ mod tests {
                 0,
                 &mut memory_mapping,
             );
-            result.unwrap();
+            assert_eq!(result.unwrap(), 0);
 
             let hashes_from_buf = bincode::deserialize::<SlotHashes>(&got_hashes_buf).unwrap();
             assert_eq!(hashes_from_buf, src_hashes);
@@ -4071,6 +4157,7 @@ mod tests {
         src_clock.unix_timestamp = 5;
 
         let clock_id_va = 0x100000000;
+        let clock_id = Clock::id().to_bytes();
 
         let mut got_clock_buf_rw = vec![0; Clock::size_of()];
         let got_clock_buf_rw_va = 0x200000000;
@@ -4080,7 +4167,7 @@ mod tests {
 
         let mut memory_mapping = MemoryMapping::new(
             vec![
-                MemoryRegion::new_readonly(&Clock::id().to_bytes(), clock_id_va),
+                MemoryRegion::new_readonly(&clock_id, clock_id_va),
                 MemoryRegion::new_writable(&mut got_clock_buf_rw, got_clock_buf_rw_va),
                 MemoryRegion::new_readonly(&got_clock_buf_ro, got_clock_buf_ro_va),
             ],

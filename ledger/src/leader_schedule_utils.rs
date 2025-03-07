@@ -1,5 +1,5 @@
 use {
-    crate::leader_schedule::LeaderSchedule,
+    crate::leader_schedule::{IdentityKeyedLeaderSchedule, LeaderSchedule},
     solana_runtime::bank::Bank,
     solana_sdk::{
         clock::{Epoch, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
@@ -10,21 +10,15 @@ use {
 
 /// Return the leader schedule for the given epoch.
 pub fn leader_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
-    bank.epoch_staked_nodes(epoch).map(|stakes| {
-        let mut seed = [0u8; 32];
-        seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-        let mut stakes: Vec<_> = stakes
-            .iter()
-            .map(|(pubkey, stake)| (*pubkey, *stake))
-            .collect();
-        sort_stakes(&mut stakes);
-        LeaderSchedule::new(
-            &stakes,
-            seed,
-            bank.get_slots_in_epoch(epoch),
-            NUM_CONSECUTIVE_LEADER_SLOTS,
-        )
-    })
+    bank.epoch_staked_nodes(epoch)
+        .map(|stakes| -> LeaderSchedule {
+            Box::new(IdentityKeyedLeaderSchedule::new(
+                &stakes,
+                epoch,
+                bank.get_slots_in_epoch(epoch),
+                NUM_CONSECUTIVE_LEADER_SLOTS,
+            ))
+        })
 }
 
 /// Map of leader base58 identity pubkeys to the slot indices relative to the first epoch slot
@@ -65,22 +59,6 @@ pub fn first_of_consecutive_leader_slots(slot: Slot) -> Slot {
     (slot / NUM_CONSECUTIVE_LEADER_SLOTS) * NUM_CONSECUTIVE_LEADER_SLOTS
 }
 
-fn sort_stakes(stakes: &mut Vec<(Pubkey, u64)>) {
-    // Sort first by stake. If stakes are the same, sort by pubkey to ensure a
-    // deterministic result.
-    // Note: Use unstable sort, because we dedup right after to remove the equal elements.
-    stakes.sort_unstable_by(|(l_pubkey, l_stake), (r_pubkey, r_stake)| {
-        if r_stake == l_stake {
-            r_pubkey.cmp(l_pubkey)
-        } else {
-            r_stake.cmp(l_stake)
-        }
-    });
-
-    // Now that it's sorted, we can do an O(n) dedup.
-    stakes.dedup();
-}
-
 #[cfg(test)]
 mod tests {
     use {
@@ -98,15 +76,14 @@ mod tests {
                 .genesis_config;
         let bank = Bank::new_for_tests(&genesis_config);
 
-        let pubkeys_and_stakes: Vec<_> = bank
+        let pubkeys_and_stakes: HashMap<_, _> = bank
             .current_epoch_staked_nodes()
             .iter()
             .map(|(pubkey, stake)| (*pubkey, *stake))
             .collect();
-        let seed = [0u8; 32];
-        let leader_schedule = LeaderSchedule::new(
+        let leader_schedule = IdentityKeyedLeaderSchedule::new(
             &pubkeys_and_stakes,
-            seed,
+            0,
             genesis_config.epoch_schedule.slots_per_epoch,
             NUM_CONSECUTIVE_LEADER_SLOTS,
         );
@@ -124,32 +101,5 @@ mod tests {
                 .genesis_config;
         let bank = Bank::new_for_tests(&genesis_config);
         assert_eq!(slot_leader_at(bank.slot(), &bank).unwrap(), pubkey);
-    }
-
-    #[test]
-    fn test_sort_stakes_basic() {
-        let pubkey0 = solana_pubkey::new_rand();
-        let pubkey1 = solana_pubkey::new_rand();
-        let mut stakes = vec![(pubkey0, 1), (pubkey1, 2)];
-        sort_stakes(&mut stakes);
-        assert_eq!(stakes, vec![(pubkey1, 2), (pubkey0, 1)]);
-    }
-
-    #[test]
-    fn test_sort_stakes_with_dup() {
-        let pubkey0 = solana_pubkey::new_rand();
-        let pubkey1 = solana_pubkey::new_rand();
-        let mut stakes = vec![(pubkey0, 1), (pubkey1, 2), (pubkey0, 1)];
-        sort_stakes(&mut stakes);
-        assert_eq!(stakes, vec![(pubkey1, 2), (pubkey0, 1)]);
-    }
-
-    #[test]
-    fn test_sort_stakes_with_equal_stakes() {
-        let pubkey0 = Pubkey::default();
-        let pubkey1 = solana_pubkey::new_rand();
-        let mut stakes = vec![(pubkey0, 1), (pubkey1, 1)];
-        sort_stakes(&mut stakes);
-        assert_eq!(stakes, vec![(pubkey1, 1), (pubkey0, 1)]);
     }
 }

@@ -219,7 +219,6 @@ all_test_steps() {
              ^fetch-perf-libs.sh \
              ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
              cargo-build-sbf$ \
              cargo-test-sbf$ \
       ; then
@@ -227,7 +226,6 @@ all_test_steps() {
   - command: "ci/docker-run-default-image.sh ci/test-stable-sbf.sh"
     name: "stable-sbf"
     timeout_in_minutes: 35
-    artifact_paths: "sbf-dumps.tar.bz2"
     agents:
       queue: "solana"
 EOF
@@ -262,7 +260,6 @@ EOF
              ^fetch-perf-libs.sh \
              ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
              cargo-build-sbf$ \
              cargo-test-sbf$ \
              ^ci/downstream-projects \
@@ -272,18 +269,6 @@ EOF
   else
     annotate --style info \
       "downstream-projects skipped as no relevant files were modified"
-  fi
-
-  # Wasm support
-  if affects \
-             ^ci/test-wasm.sh \
-             ^ci/test-stable.sh \
-             ^sdk/ \
-      ; then
-    command_step wasm "ci/docker-run-default-image.sh ci/test-wasm.sh" 20
-  else
-    annotate --style info \
-      "wasm skipped as no relevant files were modified"
   fi
 
   # Coverage...

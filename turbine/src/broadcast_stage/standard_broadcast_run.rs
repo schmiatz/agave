@@ -9,12 +9,10 @@ use {
     solana_entry::entry::Entry,
     solana_ledger::{
         blockstore,
-        shred::{shred_code, ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        shred::{shred_code, ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder},
     },
-    solana_sdk::{
-        genesis_config::ClusterType, hash::Hash, signature::Keypair, timing::AtomicInterval,
-    },
-    std::{sync::RwLock, time::Duration},
+    solana_sdk::{hash::Hash, signature::Keypair, timing::AtomicInterval},
+    std::{borrow::Cow, sync::RwLock, time::Duration},
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
@@ -76,7 +74,6 @@ impl StandardBroadcastRun {
         &mut self,
         keypair: &Keypair,
         max_ticks_in_slot: u8,
-        cluster_type: ClusterType,
         stats: &mut ProcessShredsStats,
     ) -> Vec<Shred> {
         if self.completed {
@@ -84,29 +81,26 @@ impl StandardBroadcastRun {
         }
         // Set the reference_tick as if the PoH completed for this slot
         let reference_tick = max_ticks_in_slot;
-        let (mut shreds, coding_shreds) =
+        let shreds: Vec<_> =
             Shredder::new(self.slot, self.parent, reference_tick, self.shred_version)
                 .unwrap()
-                .entries_to_shreds(
+                .make_merkle_shreds_from_entries(
                     keypair,
                     &[],  // entries
                     true, // is_last_in_slot,
-                    should_chain_merkle_shreds(self.slot, cluster_type)
-                        .then_some(self.chained_merkle_root),
+                    Some(self.chained_merkle_root),
                     self.next_shred_index,
                     self.next_code_index,
-                    true, // merkle_variant
                     &self.reed_solomon_cache,
                     stats,
-                );
-        if let Some(shred) = shreds.iter().max_by_key(|shred| shred.index()) {
+                )
+                .inspect(|shred| stats.record_shred(shred))
+                .collect();
+        if let Some(shred) = shreds.iter().max_by_key(|shred| shred.fec_set_index()) {
             self.chained_merkle_root = shred.merkle_root().unwrap();
         }
-        stats.num_merkle_data_shreds += shreds.len();
-        stats.num_merkle_coding_shreds += coding_shreds.len();
         self.report_and_reset_stats(/*was_interrupted:*/ true);
         self.completed = true;
-        shreds.extend(coding_shreds);
         shreds
     }
 
@@ -117,48 +111,42 @@ impl StandardBroadcastRun {
         entries: &[Entry],
         reference_tick: u8,
         is_slot_end: bool,
-        cluster_type: ClusterType,
         process_stats: &mut ProcessShredsStats,
         max_data_shreds_per_slot: u32,
         max_code_shreds_per_slot: u32,
-    ) -> std::result::Result<
-        (
-            Vec<Shred>, // data shreds
-            Vec<Shred>, // coding shreds
-        ),
-        BroadcastError,
-    > {
-        let (data_shreds, coding_shreds) =
+    ) -> std::result::Result<Vec<Shred>, BroadcastError> {
+        let shreds: Vec<_> =
             Shredder::new(self.slot, self.parent, reference_tick, self.shred_version)
                 .unwrap()
-                .entries_to_shreds(
+                .make_merkle_shreds_from_entries(
                     keypair,
                     entries,
                     is_slot_end,
-                    should_chain_merkle_shreds(self.slot, cluster_type)
-                        .then_some(self.chained_merkle_root),
+                    Some(self.chained_merkle_root),
                     self.next_shred_index,
                     self.next_code_index,
-                    true, // merkle_variant
                     &self.reed_solomon_cache,
                     process_stats,
-                );
-        process_stats.num_merkle_data_shreds += data_shreds.len();
-        process_stats.num_merkle_coding_shreds += coding_shreds.len();
-        if let Some(shred) = data_shreds.iter().max_by_key(|shred| shred.index()) {
+                )
+                .inspect(|shred| {
+                    process_stats.record_shred(shred);
+                    let next_index = match shred.shred_type() {
+                        ShredType::Code => &mut self.next_code_index,
+                        ShredType::Data => &mut self.next_shred_index,
+                    };
+                    *next_index = (*next_index).max(shred.index() + 1);
+                })
+                .collect();
+        if let Some(shred) = shreds.iter().max_by_key(|shred| shred.fec_set_index()) {
             self.chained_merkle_root = shred.merkle_root().unwrap();
-            self.next_shred_index = shred.index() + 1;
-        };
+        }
         if self.next_shred_index > max_data_shreds_per_slot {
             return Err(BroadcastError::TooManyShreds);
         }
-        if let Some(index) = coding_shreds.iter().map(Shred::index).max() {
-            self.next_code_index = index + 1;
-        };
         if self.next_code_index > max_code_shreds_per_slot {
             return Err(BroadcastError::TooManyShreds);
         }
-        Ok((data_shreds, coding_shreds))
+        Ok(shreds)
     }
 
     #[cfg(test)]
@@ -175,10 +163,7 @@ impl StandardBroadcastRun {
         let (bsend, brecv) = unbounded();
         let (ssend, srecv) = unbounded();
         self.process_receive_results(keypair, blockstore, &ssend, &bsend, receive_results)?;
-        //data
-        let _ = self.transmit(&srecv, cluster_info, sock, bank_forks, quic_endpoint_sender);
-        let _ = self.record(&brecv, blockstore);
-        //coding
+        // Data and coding shreds are sent in a single batch.
         let _ = self.transmit(&srecv, cluster_info, sock, bank_forks, quic_endpoint_sender);
         let _ = self.record(&brecv, blockstore);
         Ok(())
@@ -202,17 +187,12 @@ impl StandardBroadcastRun {
         let mut process_stats = ProcessShredsStats::default();
 
         let mut to_shreds_time = Measure::start("broadcast_to_shreds");
-        let cluster_type = bank.cluster_type();
 
         if self.slot != bank.slot() {
             // Finish previous slot if it was interrupted.
             if !self.completed {
-                let shreds = self.finish_prev_slot(
-                    keypair,
-                    bank.ticks_per_slot() as u8,
-                    cluster_type,
-                    &mut process_stats,
-                );
+                let shreds =
+                    self.finish_prev_slot(keypair, bank.ticks_per_slot() as u8, &mut process_stats);
                 debug_assert!(shreds.iter().all(|shred| shred.slot() == self.slot));
                 // Broadcast shreds for the interrupted slot.
                 let batch_info = Some(BroadcastShredBatchInfo {
@@ -273,13 +253,12 @@ impl StandardBroadcastRun {
         let reference_tick = last_tick_height
             .saturating_add(bank.ticks_per_slot())
             .saturating_sub(bank.max_tick_height());
-        let (data_shreds, coding_shreds) = self
+        let shreds = self
             .entries_to_shreds(
                 keypair,
                 &receive_results.entries,
                 reference_tick as u8,
                 is_last_in_slot,
-                cluster_type,
                 &mut process_stats,
                 blockstore::MAX_DATA_SHREDS_PER_SLOT as u32,
                 shred_code::MAX_CODE_SHREDS_PER_SLOT as u32,
@@ -294,11 +273,11 @@ impl StandardBroadcastRun {
         // https://github.com/solana-labs/solana/blob/92a0b310c/turbine/src/broadcast_stage/standard_broadcast_run.rs#L132-L142
         // By contrast Self::insert skips the 1st data shred with index zero:
         // https://github.com/solana-labs/solana/blob/92a0b310c/turbine/src/broadcast_stage/standard_broadcast_run.rs#L367-L373
-        if let Some(shred) = data_shreds.first() {
+        if let Some(shred) = shreds.iter().find(|shred| shred.is_data()) {
             if shred.index() == 0 {
                 blockstore
-                    .insert_shreds(
-                        [shred.clone()],
+                    .insert_cow_shreds(
+                        [Cow::Borrowed(shred)],
                         None, // leader_schedule
                         true, // is_trusted
                     )
@@ -308,15 +287,9 @@ impl StandardBroadcastRun {
         to_shreds_time.stop();
 
         let mut get_leader_schedule_time = Measure::start("broadcast_get_leader_schedule");
-        // Increment by two batches, one for the data batch, one for the coding batch.
-        self.num_batches += 2;
-        let num_expected_batches = {
-            if is_last_in_slot {
-                Some(self.num_batches)
-            } else {
-                None
-            }
-        };
+        // Data and coding shreds are sent in a single batch.
+        self.num_batches += 1;
+        let num_expected_batches = is_last_in_slot.then_some(self.num_batches);
         let batch_info = Some(BroadcastShredBatchInfo {
             slot: bank.slot(),
             num_expected_batches,
@@ -327,19 +300,10 @@ impl StandardBroadcastRun {
 
         let mut coding_send_time = Measure::start("broadcast_coding_send");
 
-        // Send data shreds
-        let data_shreds = Arc::new(data_shreds);
-        debug_assert!(data_shreds.iter().all(|shred| shred.slot() == bank.slot()));
-        socket_sender.send((data_shreds.clone(), batch_info.clone()))?;
-        blockstore_sender.send((data_shreds, batch_info.clone()))?;
-
-        // Send coding shreds
-        let coding_shreds = Arc::new(coding_shreds);
-        debug_assert!(coding_shreds
-            .iter()
-            .all(|shred| shred.slot() == bank.slot()));
-        socket_sender.send((coding_shreds.clone(), batch_info.clone()))?;
-        blockstore_sender.send((coding_shreds, batch_info))?;
+        let shreds = Arc::new(shreds);
+        debug_assert!(shreds.iter().all(|shred| shred.slot() == bank.slot()));
+        socket_sender.send((shreds.clone(), batch_info.clone()))?;
+        blockstore_sender.send((shreds, batch_info))?;
 
         coding_send_time.stop();
 
@@ -367,17 +331,17 @@ impl StandardBroadcastRun {
     ) {
         // Insert shreds into blockstore
         let insert_shreds_start = Instant::now();
-        let mut shreds = Arc::unwrap_or_clone(shreds);
         // The first data shred is inserted synchronously.
         // https://github.com/solana-labs/solana/blob/92a0b310c/turbine/src/broadcast_stage/standard_broadcast_run.rs#L268-L283
-        if let Some(shred) = shreds.first() {
-            if shred.is_data() && shred.index() == 0 {
-                shreds.swap_remove(0);
-            }
-        }
+        let offset = shreds
+            .first()
+            .map(|shred| shred.is_data() && shred.index() == 0)
+            .map(usize::from)
+            .unwrap_or_default();
         let num_shreds = shreds.len();
+        let shreds = shreds.iter().skip(offset).map(Cow::Borrowed);
         blockstore
-            .insert_shreds(
+            .insert_cow_shreds(
                 shreds, /*leader_schedule:*/ None, /*is_trusted:*/ true,
             )
             .expect("Failed to insert shreds in blockstore");
@@ -507,16 +471,6 @@ impl BroadcastRun for StandardBroadcastRun {
     }
 }
 
-fn should_chain_merkle_shreds(slot: Slot, cluster_type: ClusterType) -> bool {
-    match cluster_type {
-        ClusterType::Development => true,
-        ClusterType::Devnet => true,
-        // Roll out chained Merkle shreds to ~53% of mainnet slots.
-        ClusterType::MainnetBeta => slot % 19 < 10,
-        ClusterType::Testnet => true,
-    }
-}
-
 #[cfg(test)]
 mod test {
     use {
@@ -604,7 +558,6 @@ mod test {
         let shreds = run.finish_prev_slot(
             &keypair,
             0, // max_ticks_in_slot
-            ClusterType::Development,
             &mut ProcessShredsStats::default(),
         );
         assert!(run.completed);
@@ -662,8 +615,8 @@ mod test {
         assert!(!blockstore.is_full(0));
         // Modify the stats, should reset later
         standard_broadcast_run.process_shreds_stats.receive_elapsed = 10;
-        // Broadcast stats should exist, and 2 batches should have been sent,
-        // one for data, one for coding
+        // Broadcast stats should exist, and 1 batch should have been sent,
+        // for both data and coding shreds.
         assert_eq!(
             standard_broadcast_run
                 .transmit_shreds_stats
@@ -672,7 +625,7 @@ mod test {
                 .get(standard_broadcast_run.slot)
                 .unwrap()
                 .num_batches(),
-            2
+            1
         );
         assert_eq!(
             standard_broadcast_run
@@ -682,7 +635,7 @@ mod test {
                 .get(standard_broadcast_run.slot)
                 .unwrap()
                 .num_batches(),
-            2
+            1
         );
         // Try to fetch ticks from blockstore, nothing should break
         assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), ticks0);
@@ -854,26 +807,18 @@ mod test {
                 &entries[0..entries.len() - 2],
                 0,
                 false,
-                ClusterType::Development,
                 &mut stats,
                 1000,
                 1000,
             )
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .partition::<Vec<_>, _>(Shred::is_data);
         info!("{} {}", data.len(), coding.len());
         assert!(!data.is_empty());
         assert!(!coding.is_empty());
 
-        let r = bs.entries_to_shreds(
-            &keypair,
-            &entries,
-            0,
-            false,
-            ClusterType::Development,
-            &mut stats,
-            10,
-            10,
-        );
+        let r = bs.entries_to_shreds(&keypair, &entries, 0, false, &mut stats, 10, 10);
         info!("{:?}", r);
         assert_matches!(r, Err(BroadcastError::TooManyShreds));
     }
