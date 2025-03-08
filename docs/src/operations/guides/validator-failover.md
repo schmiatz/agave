@@ -6,22 +6,22 @@ pagination_label: "Validator Guides: Node Failover"
 ---
 
 A simple two machine instance failover method is described here, which allows you to:   
-* upgrade your validator software with virtually no down time, and   
-* failover to the secondary instance when your monitoring detects a problem with the primary instance   
+* Upgrade your validator software with virtually no down time, and   
+* Failover to the secondary instance when your monitoring detects a problem with the primary instance   
 without any safety issues that would otherwise be associated with running two instances of your validator.   
 
-You will need:
-* Two non-delinquent validator nodes
-* identities that are not associated with a staked vote account on both validators to use when not actively voting
-* Validator startup scripts both modified to use symbolic link as the identity
-* Validator startup scripts both modified to include staked identity as authorized voter
+You will need:   
+* Two non-delinquent validator nodes   
+* Identities that are not associated with a staked vote account on both validators to use when not actively voting   
+* Validator startup scripts both modified to use symbolic link as the identity   
+* Validator startup scripts both modified to include staked identity as authorized voter   
 
 ## Setup
 
-### Generating a unstaked Secondary Identity
+### Generating an Unstaked Secondary Identity
 
-Both validators need to have secondary identities to assume when not actively voting.    
-You can generate these unstaked identities on each of your validators like so:      
+Both validators need to have secondary (unstaked) identities to assume when not actively voting.    
+You can generate these secondary identities on each of your validators like so:     
 ```
 solana-keygen new -s --no-bip39-passphrase -o unstaked-identity.json
 ```
@@ -32,7 +32,7 @@ The identity flag and authorized voter flags should be modified on both validato
 Note that `identity.json` is not a real file but a symbolic link we will create shortly.    
 However, the authorized voter flag does need to point to the staked identity file (your main identity).    
 In this guide, the main identity is renamed to `staked-identity.json` for clarity and simplicity.    
-You can certainly name yours whatever you'd like, just make sure they are specified as authorized voters as shown below.   
+You can certainly name your main identity file however you'd like; just make sure it is specified as an authorized voter as shown below:   
    
 ```
 exec /home/sol/bin/agave-validator \
@@ -62,10 +62,10 @@ ln -sf /home/sol/unstaked-identity.json /home/sol/identity.json
 ```
 
 ### Transition Preparation Checklist
-At this point on both validators you should have:   
-* Generated unstaked identities   
-* Updated your validator startup scripts   
-* Created symbolic links to point to respective identities   
+At this point, you should have completed the following on each validator:    
+* Generated an unstaked identity    
+* Updated your validator startup script    
+* Created a symbolic link to point to the respective identity file    
    
 If you have done this - great! You're ready to transition!
    
@@ -79,7 +79,7 @@ If you have done this - great! You're ready to transition!
 ```
 #!/bin/bash
 
-# example script of the above steps - change IP obviously
+# example script of the above steps - change specifics such as user / IP / ledger path
 agave-validator -l /mnt/ledger wait-for-restart-window --min-idle-time 2 --skip-new-snapshot-check
 agave-validator -l /mnt/ledger set-identity /home/sol/unstaked-identity.json
 ln -sf /home/sol/unstaked-identity.json /home/sol/identity.json
@@ -102,6 +102,3 @@ ln -sf /home/sol/staked-identity.json /home/sol/identity.json
    
 ### Verification
 Verify identities transitioned successfully using either `agave-validator monitor` or `solana catchup --our-localhost 8899`
-
-
-
